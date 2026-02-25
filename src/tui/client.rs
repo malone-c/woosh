@@ -126,9 +126,13 @@ fn decode_samples(hex: &str) -> Vec<f32> {
             if chunk.len() != 8 {
                 return None;
             }
-            let s = std::str::from_utf8(chunk).ok()?;
-            let n = u32::from_str_radix(s, 16).ok()?;
-            Some(f32::from_le_bytes(n.to_le_bytes()))
+            let mut bytes = [0u8; 4];
+            for (i, pair) in chunk.chunks(2).enumerate() {
+                let s = std::str::from_utf8(pair).ok()?;
+                let n = u8::from_str_radix(s, 16).ok()?;
+                bytes[i] = n;
+            }
+            Some(f32::from_le_bytes(bytes))
         })
         .collect()
 }
