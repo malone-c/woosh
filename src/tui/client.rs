@@ -136,3 +136,99 @@ fn decode_samples(hex: &str) -> Vec<f32> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::decode_samples;
+
+    fn encode_samples(samples: &[f32]) -> String {
+        let mut out = String::with_capacity(samples.len() * 8);
+        for &s in samples {
+            for b in s.to_le_bytes() {
+                out.push_str(&format!("{b:02x}"));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_decode_known_value_one() {
+        let hex = "0000803f";
+        let samples = decode_samples(hex);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0], 1.0);
+    }
+
+    #[test]
+    fn test_decode_known_value_half() {
+        let hex = "0000003f";
+        let samples = decode_samples(hex);
+        assert_eq!(samples.len(), 1);
+        assert!((samples[0] - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_decode_known_value_negative() {
+        let hex = "000080bf";
+        let samples = decode_samples(hex);
+        assert_eq!(samples.len(), 1);
+        assert!((samples[0] - (-1.0)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_decode_known_value_zero() {
+        let hex = "00000000";
+        let samples = decode_samples(hex);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0], 0.0);
+    }
+
+    #[test]
+    fn test_roundtrip_various_values() {
+        let samples = vec![0.0, 0.25, 0.5, 0.75, 1.0, -0.5, -1.0, 0.1234567];
+        let encoded = encode_samples(&samples);
+        let decoded = decode_samples(&encoded);
+        assert_eq!(decoded.len(), samples.len());
+        for (original, decoded_val) in samples.iter().zip(decoded.iter()) {
+            assert!(
+                (original - decoded_val).abs() < 1e-6,
+                "expected {}, got {}",
+                original,
+                decoded_val
+            );
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_small_values() {
+        let samples = vec![1e-10, -1e-10, 1e-5, -1e-5];
+        let encoded = encode_samples(&samples);
+        let decoded = decode_samples(&encoded);
+        assert_eq!(decoded.len(), samples.len());
+        for (original, decoded_val) in samples.iter().zip(decoded.iter()) {
+            assert!(
+                (original - decoded_val).abs() < 1e-10,
+                "expected {}, got {}",
+                original,
+                decoded_val
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_multiple_samples() {
+        let hex = "0000803f0000003f000080bf";
+        let samples = decode_samples(hex);
+        assert_eq!(samples.len(), 3);
+        assert_eq!(samples[0], 1.0);
+        assert!((samples[1] - 0.5).abs() < f32::EPSILON);
+        assert!((samples[2] - (-1.0)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_decode_invalid_length_ignored() {
+        let hex = "0000803f00";
+        let samples = decode_samples(hex);
+        assert_eq!(samples.len(), 1);
+    }
+}
