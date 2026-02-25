@@ -8,6 +8,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::io::{Read as _, Write as _};
+use tracing_subscriber::EnvFilter;
 use woosh::daemon;
 
 /// A terminal white noise generator.
@@ -34,6 +35,14 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    // Initialize logging with RUST_LOG env var (default: info)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info"))
+        )
+        .init();
+
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Daemon { no_daemonize }) => run_daemon(no_daemonize),
