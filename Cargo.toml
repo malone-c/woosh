@@ -1,0 +1,39 @@
+[package]
+name = "woosh"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal white noise generator with daemon/TUI architecture"
+license = "MIT"
+repository = "https://github.com/malone-c/woosh"
+rust-version = "1.75"
+
+[[bin]]
+name = "woosh"
+path = "src/main.rs"
+
+[dependencies]
+ratatui            = "0.29"
+crossterm          = "0.28"
+rodio              = "0.20"
+tokio              = { version = "1", features = ["full"] }
+rand               = "0.8"
+ringbuf            = "0.4"
+spectrum-analyzer  = "1"
+daemonize          = "0.5"
+serde              = { version = "1", features = ["derive"] }
+toml               = "0.8"
+dirs               = "5"
+anyhow             = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap               = { version = "4", features = ["derive"] }
+
+[lints.clippy]
+all       = "warn"
+pedantic  = "warn"
+
+[profile.release]
+opt-level       = 3
+lto             = true
+codegen-units   = 1
+strip           = true
