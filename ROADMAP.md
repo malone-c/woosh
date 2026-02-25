@@ -10,12 +10,12 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 ### Tasks
 
-- [ ] `cargo new woosh` with workspace layout (single crate for now)
-- [ ] Add all Phase 1 dependencies to `Cargo.toml` (`rodio`, `ratatui`, `crossterm`, `tokio`, `rand`, `daemonize`, `dirs`, `anyhow`, `tracing`, `tracing-subscriber`, `serde`, `toml`)
-- [ ] Set up `rustfmt.toml` and `clippy` deny list (`clippy::all`, `clippy::pedantic`)
-- [ ] Add `.github/workflows/ci.yml`: `cargo check`, `cargo clippy`, `cargo test`, `cargo fmt --check`
-- [ ] Stub `main.rs` with a CLI argument parser (`clap`) that routes to `daemon`, `stop`, `status`, and default (TUI) subcommands — each printing "not yet implemented"
-- [ ] Verify `cargo build --release` succeeds with zero warnings
+- [x] `cargo new woosh` with workspace layout (single crate for now)
+- [x] Add all Phase 1 dependencies to `Cargo.toml` (`rodio`, `ratatui`, `crossterm`, `tokio`, `rand`, `daemonize`, `dirs`, `anyhow`, `tracing`, `tracing-subscriber`, `serde`, `toml`)
+- [x] Set up `rustfmt.toml` and `clippy` deny list (`clippy::all`, `clippy::pedantic`)
+- [x] Add `.github/workflows/ci.yml`: `cargo check`, `cargo clippy`, `cargo test`, `cargo fmt --check`
+- [x] Stub `main.rs` with a CLI argument parser (`clap`) that routes to `daemon`, `stop`, `status`, and default (TUI) subcommands — each printing "not yet implemented"
+- [x] Verify `cargo build --release` succeeds with zero warnings
 
 ### Exit Criteria
 
@@ -37,43 +37,43 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 #### 1.1 — Noise source
 
-- [ ] Implement `NoiseSource` struct with `Iterator<Item = f32>` and `rodio::Source` trait
-- [ ] White noise: uniform random samples from `SmallRng` (seeded via `rand::thread_rng()`)
-- [ ] Per-sample volume scaling via `self.volume`
-- [ ] Unit test: 10 000 sample sequence has mean ≈ 0 and std dev ≈ 0.577 (uniform [-1, 1])
+- [x] Implement `NoiseSource` struct with `Iterator<Item = f32>` and `rodio::Source` trait
+- [x] White noise: uniform random samples from `SmallRng` (seeded via `rand::thread_rng()`)
+- [x] Per-sample volume scaling via `self.volume`
+- [x] Unit test: 10 000 sample sequence has mean ≈ 0 and std dev ≈ 0.577 (uniform [-1, 1])
 
 #### 1.2 — Audio output
 
-- [ ] `rodio::OutputStream` + `Sink` created in `daemon/audio.rs`
-- [ ] `NoiseSource` appended to `Sink` on `PLAY`; `Sink::pause()` / `Sink::play()` on `STOP` / `PLAY`
-- [ ] `Arc<Mutex<DaemonState>>` shared between audio thread and IPC handler
+- [x] `rodio::OutputStream` + `Sink` created in `daemon/audio.rs`
+- [x] `NoiseSource` appended to `Sink` on `PLAY`; `Sink::pause()` / `Sink::play()` on `STOP` / `PLAY`
+- [x] `Arc<Mutex<DaemonState>>` shared between audio thread and IPC handler
 
 #### 1.3 — Daemonize & PID
 
-- [ ] `daemonize` crate: double-fork, redirect stdio to `/dev/null`, write PID file
-- [ ] XDG-aware paths via `dirs::data_dir()` → `~/.local/share/woosh/`
-- [ ] On startup, check for stale PID file (process dead); overwrite if stale
-- [ ] `tracing` logs to `~/.local/share/woosh/woosh.log`
+- [x] `daemonize` crate: double-fork, redirect stdio to `/dev/null`, write PID file
+- [x] XDG-aware paths via `dirs::data_dir()` → `~/.local/share/woosh/`
+- [x] On startup, check for stale PID file (process dead); overwrite if stale
+- [x] `tracing` logs to `~/.local/share/woosh/woosh.log`
 
 #### 1.4 — IPC server
 
-- [ ] `tokio::net::UnixListener` on `~/.local/share/woosh/woosh.sock`
-- [ ] Spawn a task per connection; read lines, dispatch commands
-- [ ] Handle: `PLAY white`, `STOP`, `SET_VOLUME <f>`, `STATUS`, `QUIT`
-- [ ] `STATUS` response: `STATUS running preset=white volume=0.8` (or `stopped`)
-- [ ] `QUIT` removes socket + PID files and calls `std::process::exit(0)`
+- [x] `tokio::net::UnixListener` on `~/.local/share/woosh/woosh.sock`
+- [x] Spawn a task per connection; read lines, dispatch commands
+- [x] Handle: `PLAY white`, `STOP`, `SET_VOLUME <f>`, `STATUS`, `QUIT`
+- [x] `STATUS` response: `STATUS running preset=white volume=0.8` (or `stopped`)
+- [x] `QUIT` removes socket + PID files and calls `std::process::exit(0)`
 
 #### 1.5 — Auto-spawn from TUI entry point
 
-- [ ] `main.rs` default path: check PID file → if absent/stale, `spawn woosh daemon` detached → wait for socket file (poll 10 ms, timeout 500 ms) → connect
+- [x] `main.rs` default path: check PID file → if absent/stale, `spawn woosh daemon` detached → wait for socket file (poll 10 ms, timeout 500 ms) → connect
 
 #### 1.6 — `woosh stop` and `woosh status` subcommands
 
-- [ ] Connect to socket, send `QUIT` or `STATUS`, print response, exit
+- [x] Connect to socket, send `QUIT` or `STATUS`, print response, exit
 
 #### 1.7 — Integration test
 
-- [ ] Spawn daemon in-process (no daemonize) via a test helper, send IPC commands, assert responses
+- [x] Spawn daemon in-process (no daemonize) via a test helper, send IPC commands, assert responses
 
 ### Exit Criteria
 
