@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use crate::daemon::eq::N_BANDS;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -35,6 +36,36 @@ impl DaemonClient {
             .context("write command")?;
         let mut lines = BufReader::new(reader).lines();
         Ok(lines.next_line().await?.unwrap_or_default())
+    }
+
+    /// Set a single EQ band gain on the daemon (fire-and-forget).
+    ///
+    /// # Errors
+    /// Returns an error if the socket cannot be reached.
+    pub async fn set_eq_band(&self, band: usize, gain_db: f32) -> Result<()> {
+        self.send_fire_and_forget(&format!("SET_EQ {band} {gain_db:.1}"))
+            .await
+    }
+
+    /// Query the daemon for the current 10-band EQ gains.
+    ///
+    /// # Errors
+    /// Returns an error if the socket cannot be reached or the response is malformed.
+    pub async fn get_eq(&self) -> Result<[f32; N_BANDS]> {
+        let response = self.send_command("GET_EQ").await?;
+        let trimmed = response.trim();
+        if let Some(rest) = trimmed.strip_prefix("EQ ") {
+            let values: Vec<f32> = rest
+                .split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if values.len() == N_BANDS {
+                let mut gains = [0.0f32; N_BANDS];
+                gains.copy_from_slice(&values);
+                return Ok(gains);
+            }
+        }
+        anyhow::bail!("unexpected GET_EQ response: {response}")
     }
 
     /// Send a command without waiting for a response (e.g., `SET_VOLUME`).
@@ -140,12 +171,13 @@ fn decode_samples(hex: &str) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::decode_samples;
+    use std::fmt::Write as _;
 
     fn encode_samples(samples: &[f32]) -> String {
         let mut out = String::with_capacity(samples.len() * 8);
         for &s in samples {
             for b in s.to_le_bytes() {
-                out.push_str(&format!("{b:02x}"));
+                write!(out, "{b:02x}").expect("write to String is infallible");
             }
         }
         out
@@ -156,7 +188,7 @@ mod tests {
         let hex = "0000803f";
         let samples = decode_samples(hex);
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0], 1.0);
+        assert!((samples[0] - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -180,21 +212,19 @@ mod tests {
         let hex = "00000000";
         let samples = decode_samples(hex);
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0], 0.0);
+        assert!(samples[0].abs() < f32::EPSILON);
     }
 
     #[test]
     fn test_roundtrip_various_values() {
-        let samples = vec![0.0, 0.25, 0.5, 0.75, 1.0, -0.5, -1.0, 0.1234567];
+        let samples = vec![0.0, 0.25, 0.5, 0.75, 1.0, -0.5, -1.0, 0.123_456_7];
         let encoded = encode_samples(&samples);
         let decoded = decode_samples(&encoded);
         assert_eq!(decoded.len(), samples.len());
         for (original, decoded_val) in samples.iter().zip(decoded.iter()) {
             assert!(
                 (original - decoded_val).abs() < 1e-6,
-                "expected {}, got {}",
-                original,
-                decoded_val
+                "expected {original}, got {decoded_val}"
             );
         }
     }
@@ -208,9 +238,7 @@ mod tests {
         for (original, decoded_val) in samples.iter().zip(decoded.iter()) {
             assert!(
                 (original - decoded_val).abs() < 1e-10,
-                "expected {}, got {}",
-                original,
-                decoded_val
+                "expected {original}, got {decoded_val}"
             );
         }
     }
@@ -220,7 +248,7 @@ mod tests {
         let hex = "0000803f0000003f000080bf";
         let samples = decode_samples(hex);
         assert_eq!(samples.len(), 3);
-        assert_eq!(samples[0], 1.0);
+        assert!((samples[0] - 1.0).abs() < f32::EPSILON);
         assert!((samples[1] - 0.5).abs() < f32::EPSILON);
         assert!((samples[2] - (-1.0)).abs() < f32::EPSILON);
     }

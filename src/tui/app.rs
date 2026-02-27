@@ -1,3 +1,4 @@
+use crate::daemon::eq::N_BANDS;
 use crate::daemon::state::{NoisePreset, PlayState};
 
 /// Which screen the TUI is currently showing.
@@ -6,6 +7,8 @@ pub enum Screen {
     Presets,
     /// Live spectrum visualizer.
     Visualizer,
+    /// 10-band graphic equalizer.
+    Equalizer,
 }
 
 /// Number of spectrum bars.
@@ -28,6 +31,10 @@ pub struct App {
     pub sample_window: Vec<f32>,
     /// Sample rate from config (used for FFT bin mapping).
     pub sample_rate: u32,
+    /// Index of the currently selected EQ band (0..N_BANDS-1).
+    pub selected_eq_band: usize,
+    /// Per-band EQ gains in dB, mirrors daemon state.
+    pub eq_gains: [f32; N_BANDS],
     pub should_quit: bool,
 }
 
@@ -45,6 +52,8 @@ impl App {
             bar_heights: [0; NUM_BARS],
             sample_window: Vec::with_capacity(4_096),
             sample_rate,
+            selected_eq_band: 0,
+            eq_gains: [0.0f32; N_BANDS],
             should_quit: false,
         }
     }

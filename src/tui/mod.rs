@@ -9,8 +9,9 @@ use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{BarChart, Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 use spectrum_analyzer::windows::hann_window;
 use spectrum_analyzer::{samples_fft_to_spectrum, FrequencyLimit};
@@ -18,6 +19,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
 
+use crate::daemon::eq::{BAND_FREQS, GAIN_MAX, GAIN_MIN, N_BANDS};
 use crate::daemon::state::{NoisePreset, PlayState};
 
 const FFT_SIZE: usize = 2048;
@@ -39,6 +41,11 @@ async fn run_async(socket_path: PathBuf) -> Result<()> {
     let mut app = App::new(config.audio.sample_rate, config.defaults.volume);
 
     let client = DaemonClient::connect(socket_path.clone()).await?;
+
+    // Sync EQ state from daemon (best-effort; ignore errors).
+    if let Ok(gains) = client.get_eq().await {
+        app.eq_gains = gains;
+    }
 
     let (samples_tx, mut samples_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(32);
     let _sub_handle = subscribe_samples(socket_path, samples_tx).await?;
@@ -154,9 +161,47 @@ async fn handle_key(app: &mut App, client: &DaemonClient, key: KeyEvent) -> Resu
             KeyCode::Tab | KeyCode::Char('p') => {
                 app.screen = Screen::Presets;
             }
+            KeyCode::Char('e') => {
+                app.screen = Screen::Equalizer;
+            }
             KeyCode::Char('s') => {
                 client.send_command("STOP").await?;
                 app.play_state = PlayState::Stopped;
+            }
+            KeyCode::Char('q' | 'Q') => {
+                app.should_quit = true;
+            }
+            _ => {}
+        },
+        Screen::Equalizer => match key.code {
+            KeyCode::Left => {
+                if app.selected_eq_band > 0 {
+                    app.selected_eq_band -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if app.selected_eq_band + 1 < N_BANDS {
+                    app.selected_eq_band += 1;
+                }
+            }
+            KeyCode::Up => {
+                let band = app.selected_eq_band;
+                app.eq_gains[band] = (app.eq_gains[band] + 1.0).clamp(GAIN_MIN, GAIN_MAX);
+                client.set_eq_band(band, app.eq_gains[band]).await?;
+            }
+            KeyCode::Down => {
+                let band = app.selected_eq_band;
+                app.eq_gains[band] = (app.eq_gains[band] - 1.0).clamp(GAIN_MIN, GAIN_MAX);
+                client.set_eq_band(band, app.eq_gains[band]).await?;
+            }
+            KeyCode::Char('r') => {
+                app.eq_gains = [0.0f32; N_BANDS];
+                for band in 0..N_BANDS {
+                    client.set_eq_band(band, 0.0).await?;
+                }
+            }
+            KeyCode::Esc | KeyCode::Backspace => {
+                app.screen = Screen::Visualizer;
             }
             KeyCode::Char('q' | 'Q') => {
                 app.should_quit = true;
@@ -230,6 +275,7 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     match app.screen {
         Screen::Presets => render_presets(frame, app),
         Screen::Visualizer => render_visualizer(frame, app),
+        Screen::Equalizer => render_eq(frame, app),
     }
 }
 
@@ -302,6 +348,88 @@ fn render_visualizer(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(chart, chunks[1]);
 
     // Footer hints.
-    let footer = Paragraph::new(" ← → vol   p presets   s stop   q quit ");
+    let footer = Paragraph::new(" ← → vol   p presets   e eq   s stop   q quit ");
     frame.render_widget(footer, chunks[2]);
+}
+
+fn render_eq(frame: &mut ratatui::Frame, app: &App) {
+    const LABELS: [&str; N_BANDS] = [
+        "31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k",
+    ];
+
+    let chunks = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .split(frame.area());
+
+    // Header: selected band frequency and current gain.
+    let band_freq = BAND_FREQS[app.selected_eq_band];
+    let gain = app.eq_gains[app.selected_eq_band];
+    let gain_str = if gain.abs() < 0.5 {
+        "0 dB".to_owned()
+    } else {
+        format!("{gain:+.0} dB")
+    };
+    let header_text = format!(" EQ — Band: {band_freq:.0} Hz   Gain: {gain_str} ");
+    let header = Paragraph::new(header_text).block(Block::default().borders(Borders::ALL));
+    frame.render_widget(header, chunks[0]);
+
+    // Bar chart: 10 bands, each bar maps ±12 dB → 0–24.
+    let bars: Vec<Bar<'static>> = (0..N_BANDS)
+        .map(|i| {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let value = (app.eq_gains[i] + 12.0).clamp(0.0, 24.0) as u64;
+            let bar = Bar::default()
+                .value(value)
+                .label(Line::from(LABELS[i]));
+            if i == app.selected_eq_band {
+                bar.style(Style::default().fg(Color::Yellow))
+            } else {
+                bar
+            }
+        })
+        .collect();
+
+    let chart = BarChart::default()
+        .block(Block::default().title(" Equalizer ").borders(Borders::ALL))
+        .data(BarGroup::default().bars(&bars))
+        .bar_width(5)
+        .bar_gap(1)
+        .max(24);
+    frame.render_widget(chart, chunks[1]);
+
+    // Readout: all gains with selected band bracketed.
+    let readout: String = (0..N_BANDS)
+        .map(|i| {
+            let g = app.eq_gains[i];
+            let s = if g.abs() < 0.5 {
+                "0".to_owned()
+            } else if g > 0.0 {
+                #[allow(clippy::cast_possible_truncation)]
+                let v = g.round() as i32;
+                format!("+{v}")
+            } else {
+                #[allow(clippy::cast_possible_truncation)]
+                let v = g.round() as i32;
+                format!("{v}")
+            };
+            if i == app.selected_eq_band {
+                format!("[{s}]")
+            } else {
+                s
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    let readout_widget =
+        Paragraph::new(format!(" {readout} ")).block(Block::default().borders(Borders::ALL));
+    frame.render_widget(readout_widget, chunks[2]);
+
+    // Footer hints.
+    let footer =
+        Paragraph::new(" ← → band   ↑ ↓ ±1 dB   r reset   Esc back   q quit ");
+    frame.render_widget(footer, chunks[3]);
 }
