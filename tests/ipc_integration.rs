@@ -46,9 +46,9 @@ async fn status_returns_current_state() {
 
     let mut lines = BufReader::new(reader).lines();
     let line = lines.next_line().await.unwrap().unwrap();
-    assert!(line.starts_with("STATUS running"), "got: {line}");
-    assert!(line.contains("preset=white"), "got: {line}");
-    assert!(line.contains("volume=0.80"), "got: {line}");
+    assert!(line.starts_with("STATUS "), "got: {line}");
+    assert!(line.contains("synth=white:running:0.80"), "got: {line}");
+    assert!(line.contains("place=none:stopped:0.40"), "got: {line}");
 }
 
 #[tokio::test]
@@ -153,6 +153,113 @@ async fn play_brown_sends_command() {
         ),
         "unexpected command: {cmd:?}"
     );
+}
+
+#[tokio::test]
+async fn play_place_sends_command() {
+    let (socket_path, state, rx, _buf) = spawn_test_server().await;
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    writer.write_all(b"PLAY_PLACE paris\n").await.unwrap();
+
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines.next_line().await.unwrap().unwrap();
+    assert_eq!(line, "OK");
+
+    let cmd = rx
+        .recv_timeout(std::time::Duration::from_millis(200))
+        .unwrap();
+    assert!(
+        matches!(cmd, AudioCommand::PlayPlace(ref location) if location == "paris"),
+        "unexpected command: {cmd:?}"
+    );
+
+    let s = state.lock().unwrap();
+    assert_eq!(s.place_location.as_deref(), Some("paris"));
+    assert_eq!(s.place_state.to_string(), "running");
+}
+
+#[tokio::test]
+async fn play_place_replaces_previous_location() {
+    let (socket_path, state, _rx, _buf) = spawn_test_server().await;
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    writer.write_all(b"PLAY_PLACE paris\n").await.unwrap();
+    writer.write_all(b"PLAY_PLACE tokyo\n").await.unwrap();
+
+    let mut lines = BufReader::new(reader).lines();
+    assert_eq!(lines.next_line().await.unwrap().unwrap(), "OK");
+    assert_eq!(lines.next_line().await.unwrap().unwrap(), "OK");
+
+    let s = state.lock().unwrap();
+    assert_eq!(s.place_location.as_deref(), Some("tokyo"));
+}
+
+#[tokio::test]
+async fn set_place_volume_clamps() {
+    let (socket_path, state, _rx, _buf) = spawn_test_server().await;
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    writer.write_all(b"SET_PLACE_VOLUME 1.5\n").await.unwrap();
+
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines.next_line().await.unwrap().unwrap();
+    assert_eq!(line, "OK");
+
+    let place_volume = state.lock().unwrap().place_volume;
+    assert!((place_volume - 1.0).abs() < 1e-6, "place_volume={place_volume}");
+}
+
+#[tokio::test]
+async fn get_place_status_reports_channel_state() {
+    let (socket_path, _state, _rx, _buf) = spawn_test_server().await;
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    writer.write_all(b"PLAY_PLACE berlin\n").await.unwrap();
+    writer.write_all(b"GET_PLACE_STATUS\n").await.unwrap();
+
+    let mut lines = BufReader::new(reader).lines();
+    assert_eq!(lines.next_line().await.unwrap().unwrap(), "OK");
+    let line = lines.next_line().await.unwrap().unwrap();
+    assert_eq!(line, "PLACE_STATUS place=berlin:running:0.40");
+}
+
+#[tokio::test]
+async fn set_place_eq_and_get_place_eq() {
+    let (socket_path, _state, _rx, _buf) = spawn_test_server().await;
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    writer.write_all(b"SET_PLACE_EQ 3 4.2\n").await.unwrap();
+    writer.write_all(b"GET_PLACE_EQ\n").await.unwrap();
+
+    let mut lines = BufReader::new(reader).lines();
+    assert_eq!(lines.next_line().await.unwrap().unwrap(), "OK");
+    let line = lines.next_line().await.unwrap().unwrap();
+    assert!(line.starts_with("PLACE_EQ "), "got: {line}");
+    assert!(line.contains("4.2"), "got: {line}");
+}
+
+#[tokio::test]
+async fn stop_place_command_ok() {
+    let (socket_path, _state, rx, _buf) = spawn_test_server().await;
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    writer.write_all(b"STOP_PLACE\n").await.unwrap();
+
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines.next_line().await.unwrap().unwrap();
+    assert_eq!(line, "OK");
+
+    let cmd = rx
+        .recv_timeout(std::time::Duration::from_millis(200))
+        .unwrap();
+    assert!(matches!(cmd, AudioCommand::StopPlace), "unexpected command: {cmd:?}");
 }
 
 #[tokio::test]
