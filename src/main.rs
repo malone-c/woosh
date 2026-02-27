@@ -35,15 +35,19 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    // Initialize logging with RUST_LOG env var (default: info)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info"))
-        )
-        .init();
-
     let cli = Cli::parse();
+    
+    // Initialize logging with RUST_LOG env var (default: info)
+    // Skip for daemon subcommand as it initializes its own file-based logging
+    if !matches!(cli.command, Some(Commands::Daemon { .. })) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new("info"))
+            )
+            .init();
+    }
+
     match cli.command {
         Some(Commands::Daemon { no_daemonize }) => run_daemon(no_daemonize),
         Some(Commands::Stop) => run_stop(),
@@ -101,11 +105,13 @@ fn run_tui() -> Result<()> {
             .stderr(std::process::Stdio::null())
             .spawn()?;
 
-        // Poll for the socket to appear (up to 500 ms).
+        // Poll for the daemon to be ready (up to 500 ms).
+        // Wait for both the socket file AND the ready file to appear.
         let socket_path = daemon::lifecycle::socket_path()?;
+        let ready_path = daemon::lifecycle::ready_path()?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         loop {
-            if socket_path.exists() {
+            if socket_path.exists() && ready_path.exists() {
                 break;
             }
             if std::time::Instant::now() >= deadline {
