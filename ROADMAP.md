@@ -95,58 +95,58 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 #### 2.1 — TUI skeleton
 
-- [ ] `ratatui` + `crossterm` setup in `tui/mod.rs`: enable raw mode, alternate screen, cleanup on exit
-- [ ] `tokio::select!` event loop: crossterm events, 33 ms tick, socket read channel
-- [ ] `App` state machine in `tui/app.rs`: current screen, playing state, volume
+- [x] `ratatui` + `crossterm` setup in `tui/mod.rs`: enable raw mode, alternate screen, cleanup on exit
+- [x] `tokio::select!` event loop: crossterm events, 33 ms tick, socket read channel
+- [x] `App` state machine in `tui/app.rs`: current screen, playing state, volume
 
 #### 2.2 — Screen 1: Preset Selector
 
-- [ ] List widget showing `White Noise`, `Pink Noise`, `Brown Noise`
-- [ ] `↑`/`↓` navigation, `Enter` sends `PLAY <preset>`
-- [ ] Active preset highlighted; status indicator (playing / stopped)
+- [x] List widget showing `White Noise`, `Pink Noise`, `Brown Noise`
+- [x] `↑`/`↓` navigation, `Enter` sends `PLAY <preset>`
+- [x] Active preset highlighted; status indicator (playing / stopped)
 
 #### 2.3 — IPC client
 
-- [ ] `tokio::net::UnixStream` in `tui/client.rs`
-- [ ] Async send (fire-and-forget for `SET_VOLUME`; await `OK`/`ERROR` for `PLAY`/`STOP`)
-- [ ] Reconnect loop with exponential backoff if socket drops
+- [x] `tokio::net::UnixStream` in `tui/client.rs`
+- [x] Async send (fire-and-forget for `SET_VOLUME`; await `OK`/`ERROR` for `PLAY`/`STOP`)
+- [x] Reconnect loop with exponential backoff if socket drops
 
 #### 2.4 — Screen 2: Visualizer layout
 
-- [ ] Header bar: app name, preset name, status dot, volume gauge
-- [ ] `BarChart` widget placeholder (static bars) for spectrum
-- [ ] Footer: key binding hints
+- [x] Header bar: app name, preset name, status dot, volume gauge
+- [x] `BarChart` widget placeholder (static bars) for spectrum
+- [x] Footer: key binding hints
 
 #### 2.5 — Volume control
 
-- [ ] `←`/`→` on Screen 2 adjust volume ± 0.05, send `SET_VOLUME`
-- [ ] Volume gauge widget updates immediately (optimistic)
+- [x] `←`/`→` on Screen 2 adjust volume ± 0.05, send `SET_VOLUME`
+- [x] Volume gauge widget updates immediately (optimistic)
 
 #### 2.6 — Sample ring buffer (daemon side)
 
-- [ ] `ringbuf` crate: `Producer` in `NoiseSource`, `Consumer` in IPC handler
-- [ ] Daemon sends `SAMPLES <hex>` to subscribed clients every 33 ms
-- [ ] Client subscribes with `SUBSCRIBE_SAMPLES` after connecting
+- [x] `ringbuf` crate: `Producer` in `NoiseSource`, `Consumer` in IPC handler
+- [x] Daemon sends `SAMPLES <hex>` to subscribed clients every 33 ms
+- [x] Client subscribes with `SUBSCRIBE_SAMPLES` after connecting
 
 #### 2.7 — Spectrum analyzer (TUI side)
 
-- [ ] Receive `SAMPLES` batches, parse hex to `Vec<f32>`
-- [ ] Apply Hann window, run FFT via `spectrum-analyzer` crate
-- [ ] Map 2048-bin output to 24 log-spaced frequency bars (20 Hz – 20 kHz)
-- [ ] Feed bar heights to `BarChart`; update each tick
+- [x] Receive `SAMPLES` batches, parse hex to `Vec<f32>`
+- [x] Apply Hann window, run FFT via `spectrum-analyzer` crate
+- [x] Map 2048-bin output to 24 log-spaced frequency bars (20 Hz – 20 kHz)
+- [x] Feed bar heights to `BarChart`; update each tick
 
 #### 2.8 — Pink and brown noise (daemon side)
 
-- [ ] Pink noise: Paul Kellet 3-pole IIR in `NoiseSource`
-- [ ] Brown noise: running sum (random walk), normalised to ± 1
-- [ ] `PLAY pink` and `PLAY brown` recognised by IPC handler
-- [ ] Unit tests for approximate spectral slope (−3 dB/oct pink, −6 dB/oct brown)
+- [x] Pink noise: Paul Kellet 3-pole IIR in `NoiseSource`
+- [x] Brown noise: running sum (random walk), normalised to ± 1
+- [x] `PLAY pink` and `PLAY brown` recognised by IPC handler
+- [x] Unit tests for approximate spectral slope (−3 dB/oct pink, −6 dB/oct brown)
 
 #### 2.9 — Configuration file
 
-- [ ] `config.rs`: load `~/.config/woosh/config.toml` on daemon start
-- [ ] Write defaults if absent
-- [ ] Daemon respects `defaults.preset`, `defaults.volume`, `audio.sample_rate`
+- [x] `config.rs`: load `~/.config/woosh/config.toml` on daemon start
+- [x] Write defaults if absent
+- [x] Daemon respects `defaults.preset`, `defaults.volume`, `audio.sample_rate`
 
 ### Exit Criteria
 
@@ -156,7 +156,7 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 ## Phase 3 — EQ Controls
 
-**Goal:** Parametric EQ with four bands, controllable from the TUI.
+**Goal:** 10-band graphic EQ with peaking filters, controllable from the TUI.
 
 ### Spec Coverage
 
@@ -167,33 +167,125 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 #### 3.1 — Biquad filter library
 
-- [ ] Implement direct-form II transposed biquad in `daemon/audio.rs`
-- [ ] Coefficient calculators: low shelf, high shelf, peaking EQ (Audio EQ Cookbook)
-- [ ] Unit test: apply known filter, verify frequency response at target frequency (± 0.5 dB)
+- [x] Implement direct-form II transposed biquad in `daemon/eq.rs`
+- [x] Coefficient calculator: peaking EQ (Audio EQ Cookbook); identity pass-through at 0 dB
+- [x] Unit tests: identity at 0 dB, pass-through correctness, +6 dB boost amplifies b0
 
-#### 3.2 — EQ chain in NoiseSource
+#### 3.2 — EQ processor wrapping NoiseSource
 
-- [ ] `EqChain` struct: four `BiquadFilter` instances in series
-- [ ] Parameters: `gain_db`, `freq_hz`, `q` per band
-- [ ] Thread-safe update via `Arc<Mutex<DaemonState>>`
+- [x] `EqProcessor<S>` struct in `src/daemon/eq.rs`: 10 peaking filters in series
+- [x] Gains shared via `Arc<Mutex<[f32; N_BANDS]>>`; polled every 512 samples via `try_lock`
+- [x] No state reset on coefficient change — avoids audible clicks
+- [x] Appended to `rodio::Sink` as `EqProcessor<NoiseSource>`; persists across `PLAY` commands via shared Arc
 
 #### 3.3 — IPC extensions
 
-- [ ] `SET_EQ <band> <gain_db> [freq] [q]` command
-- [ ] `GET_EQ` response: all band parameters as key=value pairs
-- [ ] `config.toml` `[eq]` section persisted on `SET_EQ`
+- [x] `SET_EQ <band_index> <gain_db>` command (band 0–9, gain clamped to ±12 dB, NaN-guarded)
+- [x] `GET_EQ` response: `EQ v0 v1 ... v9` (space-separated floats)
+- [ ] `config.toml` `[eq]` section persistence — deferred to Phase 4
 
-#### 3.4 — TUI EQ panel
+#### 3.4 — TUI EQ screen
 
-- [ ] `e` key on Screen 2 opens EQ overlay panel
-- [ ] Four vertical sliders (−12 dB to +12 dB) for each band
-- [ ] `←`/`→` navigate bands; `↑`/`↓` adjust gain; `Esc` closes panel
-- [ ] Band labels: `Low Shelf`, `Peak 1`, `Peak 2`, `High Shelf`
-- [ ] Sends `SET_EQ` on each change (live preview)
+- [x] `e` key on Visualizer opens dedicated EQ screen (`Screen::Equalizer`)
+- [x] `BarChart` showing 10 bands (±12 dB → 0–24 range); selected band highlighted in yellow
+- [x] `←`/`→` navigate bands; `↑`/`↓` adjust gain ±1 dB; `r` resets all to 0 dB
+- [x] `Esc`/`Backspace` returns to Visualizer; `q` quits
+- [x] Readout line shows all gains with selected band bracketed: `[−3]  0  0  +6 …`
+- [x] EQ state synced from daemon on TUI startup via `GET_EQ`
 
 ### Exit Criteria
 
-EQ overlay opens, adjusting sliders changes the audible tone, and settings survive daemon restarts (persisted to config).
+✅ **Phase 3 Complete** — EQ screen opens from the Visualizer; adjusting bands changes the audible tone in real time. Gains reset to flat (0 dB) when the daemon restarts (config persistence is a Phase 4 follow-up).
+
+---
+
+## Phase 3.5 — Place Sounds & Interface Redesign
+
+**Goal:** Add YouTube-based ambient place sounds with dual-channel architecture, and modernize the TUI with centered layout, colors, and ASCII art.
+
+### Spec Coverage
+
+- Place Sounds (§ Place Sounds)
+- Audio Effects (§ Audio Effects)
+- Dual-channel architecture (§ Architecture)
+- TUI redesign (§ TUI, Interface Style)
+
+### Tasks
+
+#### 3.5.1 — Dual-channel audio architecture
+
+- [x] Refactor `daemon/audio.rs` to create two separate `rodio::Sink` instances: `synth_sink` and `place_sink`
+- [x] Update `DaemonState` to track two playback states: `synth_state` and `place_state`
+- [x] Ensure both sinks share the same `OutputStream` to avoid device conflicts
+- [x] Add mutex-protected shared state for volume and EQ parameters for each channel
+
+#### 3.5.2 — mpv integration for YouTube place sounds
+
+- [x] Create `daemon/mpv.rs` module to spawn mpv subprocess with PCM stdout capture
+- [x] Implement YouTube search: `ytsearch1:walking through {place}` passed to mpv
+- [x] Capture stdout PCM stream and wrap as `rodio::Source` via reader thread + `VecDeque<f32>`
+- [x] Handle mpv process lifecycle (spawn on `PLAY_PLACE`, kill on `STOP_PLACE` via `Drop`)
+- [x] Enforce single-place-at-a-time rule: kill old mpv before starting new place sound
+
+#### 3.5.3 — Fade-in audio effect
+
+- [ ] Add `fade_progress` field to `NoiseSource` (0.0 → 1.0 over 66,150 samples at 44.1 kHz ≈ 1.5s)
+- [ ] Multiply each sample by `min(fade_progress, 1.0)` and increment fade counter per sample
+- [ ] Apply same fade logic to mpv PCM wrapper source
+- [ ] Reset fade counter when `PLAY` or `PLAY_PLACE` command received
+
+#### 3.5.4 — Extended IPC protocol for place sounds
+
+- [ ] Add commands: `PLAY_PLACE <location>`, `STOP_PLACE`, `SET_PLACE_VOLUME <f32>`, `GET_PLACE_STATUS`
+- [ ] Add `SET_PLACE_EQ <band> <gain_db>` and `GET_PLACE_EQ` (10-band EQ for place channel)
+- [ ] Update `STATUS` response to include both channels: `STATUS synth=pink:playing:0.5 place=paris:playing:0.4`
+- [ ] Handle `PLAY_PLACE` conflicts: stop old place before starting new
+
+#### 3.5.5 — CLI shortcuts for quick commands
+
+- [ ] Implement `woosh pink|white|brown` shortcuts (connect to daemon, send `PLAY`, exit)
+- [ ] Implement `woosh {place}` detection (non-keyword args send `PLAY_PLACE`, exit)
+- [ ] Update `main.rs` CLI parser to route these before TUI launch
+- [ ] Change default to `pink` when no args (was `white`)
+
+#### 3.5.6 — TUI centered layout with colors
+
+- [ ] Modify `tui/mod.rs` render loop to create centered `Rect` (max 80 cols × 24 rows) with padding
+- [ ] Add colored border using `Block::default().borders(Borders::ALL).border_style(Style::fg(Color::Cyan))`
+- [ ] Create layout: Title bar (3 rows) + Main content (16 rows) + Footer (2 rows) + Status bar (1 row)
+- [ ] Apply RGB color palette (blues, purples, pinks) throughout TUI
+
+#### 3.5.7 — ASCII art and dithered backgrounds
+
+- [ ] Create `tui/art.rs` module with const string for ASCII logo ("WOOSH" in figlet font)
+- [ ] Add dithered wave/sound patterns in empty spaces (box-drawing chars: `░▒▓█`)
+- [ ] Display logo in title bar area
+- [ ] Render dithered background in margins outside centered content
+
+#### 3.5.8 — EQ as default screen
+
+- [ ] Change `Screen` enum default from `Visualizer` to `Equalizer`
+- [ ] Update Preset screen `→` key to navigate to `Equalizer` instead of `Visualizer`
+- [ ] Move spectrum analyzer to `s` key toggle (optional feature, not removed)
+- [ ] Update footer hints to reflect new navigation flow
+
+#### 3.5.9 — Place Selector screen and dual volume controls
+
+- [ ] Add new `PlaceSelector` screen accessible via `l` key
+- [ ] Show currently playing place with volume slider
+- [ ] Preset screen displays both synth and place status: `Synth: Pink ▶ 50% | Place: Paris ▶ 40%`
+- [ ] Volume controls: `←`/`→` adjust synth, `Shift+←`/`Shift+→` adjust place
+
+#### 3.5.10 — Volume defaults and config updates
+
+- [ ] Reduce synth default volume from `0.8` → `0.5`
+- [ ] Set place default volume to `0.4`
+- [ ] Add `[place]` section to `config.toml` (reverb settings, enabled flag)
+- [ ] Add `[tui]` section (default_screen, show_ascii_art, color_scheme)
+
+### Exit Criteria
+
+User can play synthetic noise + YouTube place sound simultaneously with independent volumes. TUI displays centered, colorful layout with ASCII art. All sounds fade in smoothly. CLI shortcuts `woosh pink` and `woosh tokyo` work. EQ is default screen with spectrum as toggle.
 
 ---
 
@@ -201,13 +293,15 @@ EQ overlay opens, adjusting sliders changes the audible tone, and settings survi
 
 **Goal:** User-defined presets, keyboard shortcut help overlay, and UX refinements.
 
+**Dependencies:** Requires Phase 3.5 completion.
+
 ### Tasks
 
 #### 4.1 — Named presets
 
-- [ ] `[presets]` section in `config.toml`: name → `{ noise_type, volume, eq }` map
+- [ ] `[presets]` section in `config.toml`: name → `{ noise_type, volume, eq, place_sound, place_volume }` map
 - [ ] Preset Selector screen lists built-in + user presets
-- [ ] `SAVE_PRESET <name>` IPC command saves current state as a named preset
+- [ ] `SAVE_PRESET <name>` IPC command saves current state (both channels) as a named preset
 - [ ] `DELETE_PRESET <name>` IPC command
 
 #### 4.2 — Help overlay
@@ -217,7 +311,7 @@ EQ overlay opens, adjusting sliders changes the audible tone, and settings survi
 
 #### 4.3 — Startup animation
 
-- [ ] Brief "woosh" ASCII splash on first render before daemon connect completes
+- [ ] Brief "WOOSH" ASCII splash animation on first render before daemon connect completes (fade-in effect)
 
 #### 4.4 — Status bar refinements
 
@@ -262,14 +356,15 @@ A polished, documented release candidate that a new user can install and use wit
 
 ## Milestone Summary
 
-| Phase | Description | Key Deliverable |
-|-------|-------------|-----------------|
-| 0 | Project scaffold | Compilable repo, CI green |
-| 1 | Audio daemon MVP | White noise plays, IPC works |
-| 2 | TUI + Visualizer | Interactive UI, spectrum bars, pink/brown noise |
-| 3 | EQ controls | Parametric EQ from TUI |
-| 4 | Presets & polish | Named presets, help overlay, mouse support |
-| 5 | Packaging | Homebrew, AUR, crates.io |
+| Phase | Description | Key Deliverable | Status |
+|-------|-------------|-----------------|--------|
+| 0 | Project scaffold | Compilable repo, CI green | ✅ Complete |
+| 1 | Audio daemon MVP | White noise plays, IPC works | ✅ Complete |
+| 2 | TUI + Visualizer | Interactive UI, spectrum bars, pink/brown noise | ✅ Complete |
+| 3 | EQ controls | Parametric EQ from TUI | ✅ Complete |
+| 3.5 | Place sounds & UI redesign | YouTube integration, dual audio, centered layout, ASCII art | 🚧 Planned |
+| 4 | Presets & polish | Named presets, help overlay, mouse support | 📋 Future |
+| 5 | Packaging | Homebrew, AUR, crates.io | 📋 Future |
 
 ---
 

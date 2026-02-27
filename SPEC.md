@@ -1,6 +1,6 @@
 # Woosh — Product Specification
 
-> A terminal white noise generator with a daemon/TUI architecture, spectrum visualization, and EQ controls.
+> A terminal ambient noise generator with a daemon/TUI architecture featuring synthetic noise (white/pink/brown), YouTube place sounds, EQ controls, and a colorful ASCII art interface.
 
 ---
 
@@ -9,58 +9,74 @@
 1. [Overview](#overview)
 2. [Architecture](#architecture)
 3. [Noise Generation](#noise-generation)
-4. [Audio Daemon](#audio-daemon)
-5. [IPC Protocol](#ipc-protocol)
-6. [TUI](#tui)
-7. [Spectrum Analyzer](#spectrum-analyzer)
-8. [EQ System](#eq-system)
-9. [Crate Inventory](#crate-inventory)
-10. [File & Directory Layout](#file--directory-layout)
-11. [Configuration](#configuration)
-12. [Error Handling](#error-handling)
-13. [Platform Support](#platform-support)
+4. [Place Sounds](#place-sounds)
+5. [Audio Effects](#audio-effects)
+6. [Audio Daemon](#audio-daemon)
+7. [IPC Protocol](#ipc-protocol)
+8. [TUI](#tui)
+9. [Spectrum Analyzer](#spectrum-analyzer)
+10. [EQ System](#eq-system)
+11. [Crate Inventory](#crate-inventory)
+12. [File & Directory Layout](#file--directory-layout)
+13. [Configuration](#configuration)
+14. [Error Handling](#error-handling)
+15. [Platform Support](#platform-support)
 
 ---
 
 ## Overview
 
-Woosh is a command-line white noise app written in Rust. It plays continuous synthetic ambient noise (white, pink, brown) through the system audio output. A persistent background daemon owns the audio device and synthesis pipeline; a lightweight TUI client connects to the daemon over a Unix domain socket to control playback and display a live spectrum visualizer.
+Woosh is a command-line ambient noise app written in Rust. It plays continuous synthetic noise (white, pink, brown) and YouTube-sourced place sounds (e.g., "walking through Paris") through the system audio output. A persistent background daemon owns the audio device and synthesis pipeline; a lightweight TUI client connects to the daemon over a Unix domain socket to control playback and display a colorful, ASCII art-enhanced interface with EQ controls.
 
 ### Goals
 
-- **No sample files** — all noise is generated algorithmically at runtime.
-- **Low resource usage** — the daemon should idle at < 1 % CPU when playing.
-- **Interactive TUI** — real-time visualizer, volume control, EQ, and preset switching without leaving the terminal.
+- **Dual audio channels** — play synthetic noise and YouTube place sounds simultaneously, each with independent volume and EQ.
+- **No sample files** — all synthetic noise is generated algorithmically at runtime.
+- **YouTube integration** — stream ambient place sounds via mpv + yt-dlp without pre-downloading.
+- **Low resource usage** — the daemon should idle at < 1 % CPU when playing synthetic noise (place sounds depend on mpv overhead).
+- **Interactive TUI** — colorful, centered interface with ASCII art, real-time EQ control, volume sliders, and preset switching.
 - **Daemon persistence** — close the TUI and audio keeps playing; reopen TUI and it reconnects instantly.
 
 ### Non-Goals
 
 - GUI / native app
-- Streaming from internet sources
 - Multi-output routing or per-app audio mixing
+- Offline place sound caching (streams directly from YouTube)
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    woosh binary                     │
-│                                                     │
-│  ┌──────────────┐        ┌──────────────────────┐  │
-│  │  TUI Client  │◄──────►│   Audio Daemon       │  │
-│  │  (ratatui)   │ Unix   │   (rodio + synth)    │  │
-│  │  crossterm   │ socket │   daemonize          │  │
-│  └──────────────┘        └──────────────────────┘  │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                         woosh binary                            │
+│                                                                 │
+│  ┌──────────────┐        ┌───────────────────────────────────┐ │
+│  │  TUI Client  │◄──────►│      Audio Daemon                 │ │
+│  │  (ratatui)   │ Unix   │                                   │ │
+│  │  crossterm   │ socket │  ┌─────────────┐  ┌────────────┐ │ │
+│  │  + ASCII art │        │  │ Synth Sink  │  │ Place Sink │ │ │
+│  └──────────────┘        │  │ (rodio)     │  │ (mpv PCM)  │ │ │
+│                          │  │ NoiseSource │  │ YouTube    │ │ │
+│                          │  │ + EQ        │  │ + EQ       │ │ │
+│                          │  └─────────────┘  └────────────┘ │ │
+│                          │         │               │         │ │
+│                          │         └───────┬───────┘         │ │
+│                          │            Audio Device           │ │
+│                          └───────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 The single compiled binary (`woosh`) serves both roles:
 
-- **`woosh`** (no subcommand) — launches the TUI. If no daemon is running, it spawns one in the background first.
+- **`woosh`** (no subcommand) — launches the TUI with pink noise as default. If no daemon is running, it spawns one in the background first.
+- **`woosh pink|white|brown`** — quick command to play specific synthetic noise type without TUI, then exit.
+- **`woosh {place}`** — quick command to play YouTube place sound (e.g., `woosh paris`), then exit.
 - **`woosh daemon`** — starts the daemon in the foreground (used internally by the auto-spawn path).
 - **`woosh stop`** — sends `QUIT` to the daemon and exits.
 - **`woosh status`** — prints current daemon state to stdout and exits.
+
+The daemon manages two independent audio channels that can play simultaneously: **synth** (algorithmic noise generation) and **place** (YouTube streams via mpv).
 
 ---
 
@@ -72,13 +88,13 @@ Noise is synthesised algorithmically. No WAV/OGG files are bundled or loaded.
 
 ### Noise Types
 
-| Type  | Algorithm | Description |
-|-------|-----------|-------------|
-| White | PRNG — uniform distribution over `[-1.0, 1.0]` | Equal energy per Hz; sounds bright/hissy |
-| Pink  | Paul Kellet's 3-pole IIR approximation | Equal energy per octave; natural, balanced |
-| Brown | Integration of white noise (random walk) | High bass content; deep rumble |
+| Type  | Algorithm | Description | Status |
+|-------|-----------|-------------|--------|
+| White | PRNG — uniform distribution over `[-1.0, 1.0]` | Equal energy per Hz; sounds bright/hissy | ✓ |
+| Pink  | Paul Kellet's 3-pole IIR approximation | Equal energy per octave; natural, balanced | **✓ Default** |
+| Brown | Integration of white noise (random walk) | High bass content; deep rumble | ✓ |
 
-**MVP ships white noise only.** Pink and brown are reserved for Phase 2.
+**Default is pink noise** (changed from white in Phase 3.5). All three types are fully implemented.
 
 ### Implementation
 
@@ -108,14 +124,94 @@ Default 44 100 Hz, stereo. Configurable in `~/.config/woosh/config.toml`.
 
 ---
 
+## Place Sounds
+
+### Overview
+
+Woosh can stream ambient sounds from YouTube via the `mpv` media player with `yt-dlp` integration. Users type `woosh {place}` (e.g., `woosh tokyo`) and the daemon searches YouTube for "walking through {place}", picks a random video from results, skips the first 5 minutes (to avoid intro music), and streams audio-only to a second audio channel.
+
+### Architecture
+
+Place sounds run in a **separate audio channel** from synthetic noise. The daemon spawns an `mpv` subprocess with these flags:
+
+```bash
+mpv "ytsearch1:walking through {place}" \
+    --no-video \
+    --audio-display=no \
+    --ytdl \
+    --start=300 \
+    --af=aformat=s16:44100 \
+    --ao=pcm:file=/dev/stdout
+```
+
+- `ytsearch1:` — YouTube search, pick first result (randomization handled by query variation)
+- `--start=300` — skip first 5 minutes (300 seconds)
+- `--ao=pcm:file=/dev/stdout` — output raw PCM to stdout instead of system audio device
+- `--af=aformat=s16:44100` — force 16-bit signed PCM at 44.1 kHz to match synth sample rate
+
+The daemon captures stdout via `BufReader<ChildStdout>`, wraps it as a `rodio::Source`, applies EQ and volume, and appends it to the `place_sink`.
+
+### Single Place Rule
+
+Only **one place sound can play at a time**. If the user requests a new place while another is playing, the daemon kills the old `mpv` process and spawns a new one.
+
+### Mixing with Synthetic Noise
+
+The user can play **one synthetic noise (white/pink/brown) + one place sound simultaneously**. Each channel has independent volume control but shares a unified EQ by default (see § EQ System).
+
+### Reverb Effect
+
+Place sounds can optionally have reverb applied via `mpv`'s `--af=reverb` audio filter or post-processing in the daemon. Default: **off** (configurable in `config.toml`). Adds atmospheric depth to place sounds.
+
+### Dependencies
+
+- **mpv** — installed on user's system, must be in `$PATH`
+- **yt-dlp** — required for YouTube search and streaming; mpv calls this automatically if installed
+
+If `mpv` or `yt-dlp` is missing, place sound commands gracefully fail with an error message and synth-only mode remains available.
+
+---
+
+## Audio Effects
+
+### Fade-In
+
+All audio sources (synth noise and place sounds) **fade in over 1–2 seconds** when playback starts. This prevents sudden loud bursts that can be jarring.
+
+**Implementation:** Linear volume ramp from `0.0` → `target_volume` over 66,150 samples at 44.1 kHz (≈ 1.5 seconds). Each sample is multiplied by `min(fade_progress, 1.0)` where `fade_progress` increments per sample. Fade resets when a new `PLAY` command is received.
+
+### Volume Defaults
+
+| Channel | Default Volume | Notes |
+|---------|----------------|-------|
+| Synth   | 0.5            | Reduced from 0.8 to avoid excessive loudness |
+| Place   | 0.4            | Slightly quieter than synth for balanced mixing |
+
+Users can adjust volumes independently via IPC commands or TUI controls.
+
+### Reverb (Optional)
+
+Place sounds can have reverb effect applied for atmospheric ambience. Configured via `~/.config/woosh/config.toml`:
+
+```toml
+[place]
+reverb = false      # default: off
+reverb_amount = 0.3 # 0.0 – 1.0, only used if reverb = true
+```
+
+Reverb adds CPU overhead (mpv subprocess filter chain), so it defaults to disabled.
+
+---
+
 ## Audio Daemon
 
 ### Responsibilities
 
-- Own the `rodio::OutputStream` and `Sink`.
-- Run the synthesis loop (via the `rodio::Source` implementation).
-- Listen on the Unix socket and handle IPC commands.
-- Maintain a fixed-size ring buffer of recent PCM samples for the visualizer.
+- Own the `rodio::OutputStream` and two `Sink` instances (synth + place).
+- Run the synthesis loop for synthetic noise (via the `rodio::Source` implementation).
+- Manage `mpv` subprocess for YouTube place sounds (spawn, monitor, kill).
+- Listen on the Unix socket and handle IPC commands for both channels.
+- Maintain fixed-size ring buffers of recent PCM samples for the visualizer (one per channel).
 - Write and clean up the PID file.
 
 ### Lifecycle
@@ -152,13 +248,23 @@ A simple line-oriented text protocol over a Unix domain socket. Each message is 
 
 | Command | Example | Description |
 |---------|---------|-------------|
-| `PLAY <preset>` | `PLAY white` | Start or switch to a noise preset |
-| `STOP` | `STOP` | Pause audio output |
-| `SET_VOLUME <f32>` | `SET_VOLUME 0.75` | Set volume, clamped to `[0.0, 1.0]` |
-| `SET_EQ <band> <gain_db>` | `SET_EQ high_shelf 3.0` | Adjust an EQ band (Phase 3+) |
-| `STATUS` | `STATUS` | Request current state |
-| `QUIT` | `QUIT` | Shut down daemon |
-| `SAVE_PRESET <name>` | `SAVE_PRESET focus` | Save current state as a named preset |
+| **Synth Channel** |
+| `PLAY <preset>` | `PLAY pink` | Start or switch to a noise preset (white/pink/brown) |
+| `STOP` | `STOP` | Pause synth audio output |
+| `SET_VOLUME <f32>` | `SET_VOLUME 0.5` | Set synth volume, clamped to `[0.0, 1.0]` |
+| `SET_EQ <band> <gain_db>` | `SET_EQ 5 3.0` | Adjust synth EQ band by index (0–9); gain clamped to ±12 dB |
+| `GET_EQ` | `GET_EQ` | Query synth EQ (10 band gains) |
+| **Place Channel** |
+| `PLAY_PLACE <location>` | `PLAY_PLACE paris` | Start YouTube place sound (kills old place if playing) |
+| `STOP_PLACE` | `STOP_PLACE` | Stop place sound (kill mpv subprocess) |
+| `SET_PLACE_VOLUME <f32>` | `SET_PLACE_VOLUME 0.4` | Set place volume, clamped to `[0.0, 1.0]` |
+| `SET_PLACE_EQ <band> <gain_db>` | `SET_PLACE_EQ 2 -3.0` | Adjust place EQ band by index (0–9); gain clamped to ±12 dB |
+| `GET_PLACE_EQ` | `GET_PLACE_EQ` | Query place EQ (10 band gains) |
+| `GET_PLACE_STATUS` | `GET_PLACE_STATUS` | Query place state (playing, location, volume) |
+| **Global** |
+| `STATUS` | `STATUS` | Request current state of both channels |
+| `QUIT` | `QUIT` | Shut down daemon (stops both channels, kills mpv) |
+| `SAVE_PRESET <name>` | `SAVE_PRESET focus` | Save current state (both channels) as a named preset |
 | `DELETE_PRESET <name>` | `DELETE_PRESET focus` | Remove a named preset |
 
 ### Daemon → Client
@@ -167,8 +273,11 @@ A simple line-oriented text protocol over a Unix domain socket. Each message is 
 |----------|---------|-------------|
 | `OK` | `OK` | Command accepted |
 | `ERROR <msg>` | `ERROR unknown preset` | Command rejected with reason |
-| `STATUS <fields>` | `STATUS running preset=white volume=0.8` | State snapshot |
+| `STATUS <fields>` | `STATUS synth=pink:playing:0.5 place=paris:playing:0.4` | State snapshot (both channels) |
+| `PLACE_STATUS <fields>` | `PLACE_STATUS playing location=tokyo volume=0.4` | Place channel status |
 | `SAMPLES <hex>` | `SAMPLES 3f800000...` | Batch of PCM samples (little-endian f32 hex) for visualizer |
+| `EQ <values>` | `EQ 0.0 0.0 -3.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0` | Synth EQ response (10 bands) |
+| `PLACE_EQ <values>` | `PLACE_EQ 0.0 0.0 -3.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0` | Place EQ response (10 bands) |
 
 The TUI polls `STATUS` every tick and subscribes to unsolicited `SAMPLES` pushes after sending a `SUBSCRIBE_SAMPLES` command (added in Phase 2).
 
@@ -186,49 +295,118 @@ The daemon spawns one Tokio task per accepted client connection. A shared `Arc<M
 - **`crossterm`** — cross-platform terminal backend (raw mode, events)
 - **`tokio`** — async runtime; `tokio::select!` multiplexes crossterm events, socket reads, and a 33 ms tick timer (~30 fps)
 
+### Interface Style
+
+The TUI features a **centered, colorful layout with ASCII art**:
+
+- **Centered frame:** Main content area (max 80 cols × 24 rows) with colored borders and padding
+- **ASCII art logo:** "WOOSH" banner in figlet font displayed in title bar
+- **Dithered backgrounds:** Box-drawing characters (`░▒▓█`) create ambient wave patterns in margins
+- **Color palette:** Blues, purples, pinks via `Color::Rgb` for aesthetic, calming vibes
+- **Border style:** Cyan borders around main content frame
+
 ### Screens
 
 #### Screen 1 — Preset Selector
 
 ```
-┌─────────────────────────────────┐
-│  woosh                          │
-├─────────────────────────────────┤
-│                                 │
-│  ▶ White Noise                  │
-│    Pink Noise                   │
-│    Brown Noise                  │
-│                                 │
-│  [↑/↓] select  [Enter] play     │
-│  [q] quit      [→] visualizer   │
-└─────────────────────────────────┘
+       ╔═══════════════════════════════════════════════╗
+       ║   ██╗    ██╗ ██████╗  ██████╗ ███████╗██╗  ██╗║
+       ║   ██║    ██║██╔═══██╗██╔═══██╗██╔════╝██║  ██║║
+       ║   ██║ █╗ ██║██║   ██║██║   ██║███████╗███████║║
+       ║   ██║███╗██║██║   ██║██║   ██║╚════██║██╔══██║║
+       ║   ╚███╔███╔╝╚██████╔╝╚██████╔╝███████║██║  ██║║
+       ║    ╚══╝╚══╝  ╚═════╝  ╚═════╝ ╚══════╝╚═╝  ╚═╝║
+       ╠═══════════════════════════════════════════════╣
+       ║                                               ║
+       ║   Synth:  ▶ Pink    ████████░░  50%          ║
+       ║   Place:  ● Paris   ██████░░░░  40%          ║
+       ║                                               ║
+       ║   ▶ White Noise                               ║
+       ║   ● Pink Noise      (default)                 ║
+       ║     Brown Noise                               ║
+       ║                                               ║
+       ║   [↑/↓] select  [Enter] play  [l] locations  ║
+       ║   [q] quit      [→] equalizer                ║
+       ╚═══════════════════════════════════════════════╝
+░░▒▒▓▓  Ambient waves pattern in margins  ▓▓▒▒░░
 ```
 
 - Arrow keys navigate the list.
 - `Enter` sends `PLAY <preset>` to daemon.
-- `→` or `Tab` switches to Screen 2.
+- `l` opens Place Selector (Screen 4).
+- `→` or `Tab` switches to Equalizer (Screen 2, changed from Visualizer).
 
-#### Screen 2 — Visualizer + Controls
+#### Screen 2 — Equalizer (Default Screen)
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  woosh  ●  white noise  vol: ████████░░  80%        │
-├─────────────────────────────────────────────────────┤
-│                                                     │
-│  ▄  ▄▄  █  ▄▄  █▄  ▄▄  ▄  ▄▄  ▄  ▄                  │
-│  █  ██  █  ██  ██  ██  █  ██  █  █                  │
-│  █  ██  █  ██  ██  ██  █  ██  █  █                  │
-│  ──────────────────────────────────                 │
-│  63  125 250 500 1k  2k  4k  8k 16k  Hz             │
-│                                                     │
-│  [←/→] volume  [e] eq  [p] presets  [q] quit        │
-└─────────────────────────────────────────────────────┘
+       ╔═══════════════════════════════════════════════╗
+       ║  WOOSH ● Pink + Paris  Synth: 50%  Place: 40%║
+       ╠═══════════════════════════════════════════════╣
+       ║                  Equalizer                    ║
+       ║                                               ║
+       ║   ▂▄█▆▃▂▄▅▂▃                                  ║
+       ║   31 63 125 250 500 1k 2k 4k 8k 16k  Hz       ║
+       ║   [0] [0] [-3] [0] [0] [0] [0] [0] [0] [0] dB ║
+       ║                                               ║
+       ║   [←/→] select band  [↑/↓] adjust ±1 dB      ║
+       ║   [r] reset  [s] spectrum  [p] presets        ║
+       ║   [q] quit                                    ║
+       ╚═══════════════════════════════════════════════╝
 ```
 
-- Left/right arrow adjusts volume (sends `SET_VOLUME`).
-- `e` opens EQ panel (Phase 3).
-- `p` or `←` returns to Screen 1.
+- `←`/`→` navigate EQ bands, `↑`/`↓` adjust gain ±1 dB.
+- `r` resets all bands to 0 dB (flat).
+- `s` toggles Spectrum Analyzer (Screen 3, optional feature).
+- `p` returns to Preset Selector.
+- Selected band highlighted in yellow.
+
+#### Screen 3 — Spectrum Analyzer (Toggle Feature)
+
+```
+       ╔═══════════════════════════════════════════════╗
+       ║  WOOSH ● Pink + Paris  Synth: 50%  Place: 40%║
+       ╠═══════════════════════════════════════════════╣
+       ║                                               ║
+       ║   ▄  ▄▄  █  ▄▄  █▄  ▄▄  ▄  ▄▄  ▄  ▄           ║
+       ║   █  ██  █  ██  ██  ██  █  ██  █  █           ║
+       ║   █  ██  █  ██  ██  ██  █  ██  █  █           ║
+       ║   ───────────────────────────────────          ║
+       ║   63 125 250 500 1k 2k 4k 8k 16k  Hz          ║
+       ║                                               ║
+       ║   [s] back to eq  [p] presets  [q] quit      ║
+       ╚═══════════════════════════════════════════════╝
+```
+
 - Spectrum bars update at ~30 fps.
+- `s` returns to Equalizer screen.
+
+#### Screen 4 — Place Selector
+
+```
+       ╔═══════════════════════════════════════════════╗
+       ║               Place Sounds                    ║
+       ╠═══════════════════════════════════════════════╣
+       ║                                               ║
+       ║   Currently playing: Paris ▶ 40%             ║
+       ║                                               ║
+       ║   Type location and press Enter:             ║
+       ║   > tokyo_____________                        ║
+       ║                                               ║
+       ║   Recent places:                              ║
+       ║   • Paris                                     ║
+       ║   • Tokyo                                     ║
+       ║   • New York                                  ║
+       ║                                               ║
+       ║   [Esc] back  [Shift+←/→] volume  [q] quit  ║
+       ╚═══════════════════════════════════════════════╝
+```
+
+- Type location name and press `Enter` to play.
+- `Shift+←`/`→` adjust place volume.
+- `Esc` returns to Preset Selector.
+
+**Note:** Equalizer (Screen 2) is now the **default landing screen** after preset selection. Spectrum analyzer (Screen 3) is an optional toggle feature accessed via `s` key.
 
 ### Mouse Support
 
@@ -243,12 +421,17 @@ The daemon spawns one Tokio task per accepted client connection. A shared `Arc<M
 | Key | Action |
 |-----|--------|
 | `q` | Quit TUI (daemon keeps running) |
-| `Q` (shift) | Quit TUI and stop daemon |
+| `Q` (shift) | Quit TUI and stop daemon (kills both channels + mpv) |
 | `p` | Go to Preset Selector |
-| `v` | Go to Visualizer |
-| `←` / `→` | Volume down / up (on Visualizer screen) |
-| `↑` / `↓` | Navigate list (on Preset screen) |
-| `Enter` | Confirm selection |
+| `e` | Go to Equalizer (default screen) |
+| `s` | Toggle Spectrum Analyzer (from Equalizer screen) |
+| `l` | Go to Place Selector |
+| `←` / `→` | Synth volume down / up (Preset screen); select band (EQ screen) |
+| `Shift+←` / `Shift+→` | Place volume down / up (Place Selector) |
+| `↑` / `↓` | Navigate list (Preset screen); adjust EQ gain ±1 dB (EQ screen) |
+| `Enter` | Confirm selection / start playback |
+| `r` | Reset all EQ bands to 0 dB (flat) |
+| `Esc` | Return to previous screen |
 | `?` | Toggle help overlay |
 
 ---
@@ -282,29 +465,63 @@ NoiseSource → ring buffer (daemon) → SAMPLES push (IPC) → TUI FFT → BarC
 
 ## EQ System
 
-> **Phase 3 feature — not in MVP.**
+### Overview
 
-### Filter Types
+Woosh features **two independent 10-band graphic EQs**: one for synthetic noise, one for place sounds. By default, they **stay in sync** — adjusting EQ in the TUI updates both channels simultaneously. Advanced users can enable `advanced_eq_mode = true` in `config.toml` to control each EQ independently.
 
-| Band | Filter type | Default |
-|------|-------------|---------|
-| Low shelf | 2nd-order biquad | 0 dB @ 200 Hz |
-| Peak 1 | Peaking EQ | 0 dB @ 1 kHz, Q = 1.0 |
-| Peak 2 | Peaking EQ | 0 dB @ 4 kHz, Q = 1.0 |
-| High shelf | 2nd-order biquad | 0 dB @ 8 kHz |
+### Bands
+
+10-band graphic EQ with peaking filters at standard octave frequencies:
+
+| Band | Frequency | Filter type | Q | Gain range |
+|------|-----------|-------------|---|------------|
+| 0 | 31 Hz | Peaking EQ | √2 | −12 to +12 dB |
+| 1 | 63 Hz | Peaking EQ | √2 | −12 to +12 dB |
+| 2 | 125 Hz | Peaking EQ | √2 | −12 to +12 dB |
+| 3 | 250 Hz | Peaking EQ | √2 | −12 to +12 dB |
+| 4 | 500 Hz | Peaking EQ | √2 | −12 to +12 dB |
+| 5 | 1 kHz | Peaking EQ | √2 | −12 to +12 dB |
+| 6 | 2 kHz | Peaking EQ | √2 | −12 to +12 dB |
+| 7 | 4 kHz | Peaking EQ | √2 | −12 to +12 dB |
+| 8 | 8 kHz | Peaking EQ | √2 | −12 to +12 dB |
+| 9 | 16 kHz | Peaking EQ | √2 | −12 to +12 dB |
+
+Gain is adjustable in 1 dB steps. Default is 0 dB (flat) for all bands.
 
 ### Implementation
 
-Biquad filters are implemented in the `NoiseSource` chain using the Audio EQ Cookbook coefficients. Each filter is a direct-form II transposed structure for numerical stability.
+Implemented in `src/daemon/eq.rs`. Each band is a 2nd-order biquad peaking filter using the Audio EQ Cookbook coefficients, computed in the Direct Form II Transposed structure for numerical stability.
+
+`EqProcessor<S>` wraps a `rodio::Source` (currently `NoiseSource`) and applies all 10 filters in series per sample. Gains are shared between the audio thread and the IPC handler via `Arc<Mutex<[f32; 10]>>`; `EqProcessor` polls for updates every 512 samples using `try_lock` (same pattern as the sample visualizer buffer). Filter state is never reset on coefficient changes — new coefficients take effect smoothly within ~1 buffer (~12 ms), avoiding audible clicks.
+
+At exactly 0 dB, the identity filter `{b0:1, b1:0, b2:0, a1:0, a2:0}` is used for bit-perfect pass-through with no state accumulation.
 
 ### IPC Extension
 
 ```
-SET_EQ <band_id> <gain_db> [freq_hz] [q]
-GET_EQ
+# Synth EQ
+SET_EQ <band_index> <gain_db>   # band 0–9; gain clamped to [−12, +12] dB
+GET_EQ                          # response: "EQ v0 v1 v2 v3 v4 v5 v6 v7 v8 v9"
+
+# Place EQ
+SET_PLACE_EQ <band_index> <gain_db>   # band 0–9; gain clamped to [−12, +12] dB
+GET_PLACE_EQ                          # response: "PLACE_EQ v0 v1 v2 v3 v4 v5 v6 v7 v8 v9"
+
+# Sync control (future feature)
+SYNC_EQ <bool>                        # enable/disable EQ sync mode
 ```
 
-The TUI renders sliders for each band in a pop-up panel (triggered by `e`).
+### TUI
+
+The EQ screen (Screen 2) is now the **default landing screen** (changed from spectrum analyzer). It shows a `BarChart` of 10 bands (bar height maps ±12 dB → 0–24 range) with the selected band highlighted in yellow. A readout line beneath shows all gains numerically.
+
+Key bindings: `←`/`→` navigate bands, `↑`/`↓` adjust ±1 dB, `r` resets all to flat, `s` toggles spectrum analyzer, `Esc` or `p` returns to the Preset Selector.
+
+When **advanced_eq_mode = false** (default): Adjusting EQ updates both synth and place channels simultaneously.
+
+When **advanced_eq_mode = true**: TUI shows two separate EQ displays (synth and place) with a toggle to switch between them.
+
+> **Note:** EQ gains are not currently persisted to `config.toml` — they reset to flat (0 dB) when the daemon restarts. Persistence is planned for Phase 4.
 
 ---
 
@@ -387,15 +604,27 @@ sample_rate = 44100
 channels = 2        # 1 = mono, 2 = stereo
 
 [defaults]
-preset = "white"
-volume = 0.8        # 0.0 – 1.0
+preset = "pink"     # changed from "white"
+volume = 0.5        # 0.0 – 1.0, reduced from 0.8
+
+[place]
+enabled = true
+volume = 0.4        # default place sound volume
+reverb = false      # reverb effect for place sounds
+reverb_amount = 0.3 # 0.0 – 1.0, only used if reverb = true
 
 [eq]
 enabled = false
-low_shelf_gain  = 0.0   # dB
+advanced_eq_mode = false  # if true, control synth and place EQs independently
+low_shelf_gain  = 0.0     # dB
 peak1_gain      = 0.0
 peak2_gain      = 0.0
 high_shelf_gain = 0.0
+
+[tui]
+default_screen = "equalizer"  # "equalizer" or "presets"
+show_ascii_art = true
+color_scheme = "default"      # default = blues/purples/pinks
 
 [daemon]
 log_level = "info"   # error | warn | info | debug | trace
@@ -423,3 +652,11 @@ On first run, if the file is absent, woosh writes the defaults above.
 | Windows | Not supported (Unix sockets, `daemonize`) |
 
 `rodio` abstracts over CoreAudio (macOS) and ALSA/PulseAudio/PipeWire (Linux) transparently.
+
+### External Dependencies
+
+- **mpv** (with yt-dlp) — Required for place sounds feature. Must be in `$PATH`.
+  - macOS: `brew install mpv yt-dlp`
+  - Linux: `apt install mpv yt-dlp` or equivalent package manager
+
+If `mpv` or `yt-dlp` is not installed, woosh runs in **synth-only mode** (synthetic noise still works, place sounds gracefully disabled with error messages).
