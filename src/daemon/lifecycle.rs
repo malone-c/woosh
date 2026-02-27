@@ -28,6 +28,14 @@ pub fn socket_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("woosh.sock"))
 }
 
+/// Returns the path to the readiness file.
+///
+/// # Errors
+/// Returns an error if the data directory cannot be determined.
+pub fn ready_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("woosh.ready"))
+}
+
 /// Returns the path to the daemon log file.
 ///
 /// # Errors
@@ -37,6 +45,7 @@ pub fn log_path() -> Result<PathBuf> {
 }
 
 /// Returns `true` if a daemon process recorded in the PID file is alive.
+/// If the PID file exists but the process is dead, cleans up stale files.
 ///
 /// # Errors
 /// Returns an error if the data directory cannot be determined.
@@ -50,6 +59,18 @@ pub fn daemon_is_alive() -> Result<bool> {
     };
     // SAFETY: kill(pid, 0) is a standard liveness check with no side effects.
     let alive = unsafe { libc::kill(pid, 0) } == 0;
+    
+    // If process is dead, clean up stale files
+    if !alive {
+        let _ = fs::remove_file(&path);
+        if let Ok(sock_path) = socket_path() {
+            let _ = fs::remove_file(sock_path);
+        }
+        if let Ok(ready) = ready_path() {
+            let _ = fs::remove_file(ready);
+        }
+    }
+    
     Ok(alive)
 }
 
@@ -67,6 +88,13 @@ pub fn write_pid_file(pid_path: &PathBuf) -> Result<()> {
 /// Removes the PID file (best-effort; ignores errors).
 pub fn remove_pid_file() {
     if let Ok(path) = pid_path() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Removes the readiness file (best-effort; ignores errors).
+pub fn remove_ready_file() {
+    if let Ok(path) = ready_path() {
         let _ = fs::remove_file(path);
     }
 }

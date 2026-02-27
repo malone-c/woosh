@@ -1,10 +1,13 @@
 pub mod audio;
+pub mod eq;
 pub mod ipc;
 pub mod lifecycle;
+pub mod mpv;
 pub mod state;
 
 use anyhow::Result;
 use audio::AudioCommand;
+use eq::N_BANDS;
 use state::{DaemonState, NoisePreset};
 use std::sync::{Arc, Mutex};
 
@@ -21,11 +24,15 @@ pub fn start(no_daemonize: bool) -> Result<()> {
 
     let pid_path = lifecycle::pid_path()?;
     let socket_path = lifecycle::socket_path()?;
+    let ready_path = lifecycle::ready_path()?;
     let log_path = lifecycle::log_path()?;
 
     if lifecycle::daemon_is_alive()? {
         anyhow::bail!("daemon is already running");
     }
+
+    // Clean up stale ready file from previous run
+    let _ = fs::remove_file(&ready_path);
 
     if no_daemonize {
         lifecycle::write_pid_file(&pid_path)?;
@@ -50,14 +57,23 @@ pub fn start(no_daemonize: bool) -> Result<()> {
     }));
 
     let sample_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let eq_arc: Arc<Mutex<[f32; N_BANDS]>> = Arc::new(Mutex::new([0.0f32; N_BANDS]));
+    let place_eq_arc: Arc<Mutex<[f32; N_BANDS]>> = Arc::new(Mutex::new([0.0f32; N_BANDS]));
     let (tx, rx) = std::sync::mpsc::channel::<AudioCommand>();
 
-    audio::spawn_audio_thread(Arc::clone(&state), rx, Arc::clone(&sample_buf));
+    audio::spawn_audio_thread(
+        Arc::clone(&state),
+        rx,
+        Arc::clone(&sample_buf),
+        Arc::clone(&eq_arc),
+        Arc::clone(&place_eq_arc),
+    );
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(ipc::run_ipc_server(socket_path, state, tx, sample_buf))?;
+        .build()?;
+    
+    runtime.block_on(ipc::run_ipc_server(socket_path, state, tx, sample_buf))?;
 
     Ok(())
 }

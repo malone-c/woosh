@@ -1,3 +1,4 @@
+use crate::daemon::eq::N_BANDS;
 use std::fmt;
 use std::str::FromStr;
 
@@ -54,6 +55,16 @@ pub struct DaemonState {
     pub play_state: PlayState,
     pub preset: NoisePreset,
     pub volume: f32,
+    /// Per-band EQ gains in dB (−12..+12). Index 0 = 31 Hz … 9 = 16 kHz.
+    pub eq_gains: [f32; N_BANDS],
+    /// Place channel playback state.
+    pub place_state: PlayState,
+    /// Currently selected place location (if any).
+    pub place_location: Option<String>,
+    /// Place channel volume (0.0–1.0).
+    pub place_volume: f32,
+    /// Per-band place EQ gains in dB (−12..+12).
+    pub place_eq_gains: [f32; N_BANDS],
 }
 
 impl Default for DaemonState {
@@ -62,6 +73,11 @@ impl Default for DaemonState {
             play_state: PlayState::Running,
             preset: NoisePreset::White,
             volume: 0.8,
+            eq_gains: [0.0f32; N_BANDS],
+            place_state: PlayState::Stopped,
+            place_location: None,
+            place_volume: 0.4,
+            place_eq_gains: [0.0f32; N_BANDS],
         }
     }
 }

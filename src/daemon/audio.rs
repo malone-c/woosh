@@ -1,3 +1,5 @@
+use crate::daemon::eq::{EqProcessor, N_BANDS};
+use crate::daemon::mpv::MpvSource;
 use crate::daemon::state::{DaemonState, NoisePreset, PlayState};
 use rand::distributions::{Distribution, Uniform};
 use rand::rngs::SmallRng;
@@ -12,6 +14,11 @@ pub enum AudioCommand {
     Play(NoisePreset),
     Stop,
     SetVolume(f32),
+    SetEq([f32; N_BANDS]),
+    PlayPlace(String),
+    StopPlace,
+    SetPlaceVolume(f32),
+    SetPlaceEq([f32; N_BANDS]),
     Shutdown,
 }
 
@@ -145,10 +152,13 @@ impl Source for NoiseSource {
 ///
 /// # Panics
 /// Panics if a `rodio::Sink` cannot be created (audio device unavailable).
+#[allow(clippy::too_many_lines)]
 pub fn spawn_audio_thread(
     state: Arc<Mutex<DaemonState>>,
     rx: std::sync::mpsc::Receiver<AudioCommand>,
     sample_buf: Arc<Mutex<Vec<f32>>>,
+    eq_arc: Arc<Mutex<[f32; N_BANDS]>>,
+    place_eq_arc: Arc<Mutex<[f32; N_BANDS]>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let (_stream, handle) = match rodio::OutputStream::try_default() {
@@ -164,19 +174,23 @@ pub fn spawn_audio_thread(
             .map(|s| (s.preset, s.volume))
             .unwrap_or((NoisePreset::White, 0.8));
         let mut sink = rodio::Sink::try_new(&handle).expect("sink");
-        sink.append(NoiseSource::new(
-            initial_preset,
-            1.0,
-            Some(Arc::clone(&sample_buf)),
+        sink.append(EqProcessor::new(
+            NoiseSource::new(initial_preset, 1.0, Some(Arc::clone(&sample_buf))),
+            Arc::clone(&eq_arc),
         ));
         sink.set_volume(initial_volume);
+
+        let mut place_sink: Option<rodio::Sink> = None;
 
         loop {
             match rx.recv() {
                 Ok(AudioCommand::Play(preset)) => {
                     drop(sink);
                     sink = rodio::Sink::try_new(&handle).expect("sink");
-                    sink.append(NoiseSource::new(preset, 1.0, Some(Arc::clone(&sample_buf))));
+                    sink.append(EqProcessor::new(
+                        NoiseSource::new(preset, 1.0, Some(Arc::clone(&sample_buf))),
+                        Arc::clone(&eq_arc),
+                    ));
                     let volume = state.lock().map(|s| s.volume).unwrap_or(0.8);
                     sink.set_volume(volume);
                     if let Ok(mut s) = state.lock() {
@@ -197,7 +211,73 @@ pub fn spawn_audio_thread(
                         s.volume = clamped;
                     }
                 }
-                Ok(AudioCommand::Shutdown) | Err(_) => break,
+                Ok(AudioCommand::SetEq(gains)) => {
+                    if let Ok(mut guard) = eq_arc.lock() {
+                        *guard = gains;
+                    }
+                }
+                Ok(AudioCommand::PlayPlace(location)) => {
+                    place_sink = None; // kills old mpv via MpvSource::drop
+                    match MpvSource::spawn(&location) {
+                        Err(e) => {
+                            tracing::error!("audio: mpv spawn failed for {location:?}: {e}");
+                            if let Ok(mut s) = state.lock() {
+                                s.place_state = PlayState::Stopped;
+                                s.place_location = None;
+                            }
+                        }
+                        Ok(source) => match rodio::Sink::try_new(&handle) {
+                            Err(e) => {
+                                tracing::error!("audio: place sink failed: {e}");
+                                if let Ok(mut s) = state.lock() {
+                                    s.place_state = PlayState::Stopped;
+                                }
+                            }
+                            Ok(new_sink) => {
+                                new_sink.append(EqProcessor::new(
+                                    source,
+                                    Arc::clone(&place_eq_arc),
+                                ));
+                                let vol =
+                                    state.lock().map(|s| s.place_volume).unwrap_or(0.4);
+                                new_sink.set_volume(vol);
+                                if let Ok(mut s) = state.lock() {
+                                    s.place_state = PlayState::Running;
+                                    s.place_location = Some(location);
+                                }
+                                place_sink = Some(new_sink);
+                            }
+                        },
+                    }
+                }
+                Ok(AudioCommand::StopPlace) => {
+                    place_sink = None;
+                    if let Ok(mut s) = state.lock() {
+                        s.place_state = PlayState::Stopped;
+                        s.place_location = None;
+                    }
+                }
+                Ok(AudioCommand::SetPlaceVolume(v)) => {
+                    let clamped = v.clamp(0.0, 1.0);
+                    if let Ok(mut s) = state.lock() {
+                        s.place_volume = clamped;
+                    }
+                    if let Some(ref sink) = place_sink {
+                        sink.set_volume(clamped);
+                    }
+                }
+                Ok(AudioCommand::SetPlaceEq(gains)) => {
+                    if let Ok(mut guard) = place_eq_arc.lock() {
+                        *guard = gains;
+                    }
+                    if let Ok(mut s) = state.lock() {
+                        s.place_eq_gains = gains;
+                    }
+                }
+                Ok(AudioCommand::Shutdown) | Err(_) => {
+                    drop(place_sink); // kill mpv before exit
+                    break;
+                }
             }
         }
     })

@@ -1,6 +1,7 @@
 use crate::daemon::audio::AudioCommand;
-use crate::daemon::lifecycle::remove_pid_file;
-use crate::daemon::state::{DaemonState, NoisePreset};
+use crate::daemon::eq::{GAIN_MAX, GAIN_MIN, N_BANDS};
+use crate::daemon::lifecycle::{remove_pid_file, remove_ready_file};
+use crate::daemon::state::{DaemonState, NoisePreset, PlayState};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -35,6 +36,16 @@ pub async fn run_ipc_server(
         Arc::clone(&sample_buf),
         Arc::clone(&subscribers),
     ));
+
+    // Yield to the tokio runtime to ensure we're in the event loop
+    // and ready to accept connections before signaling readiness.
+    tokio::task::yield_now().await;
+
+    // Write ready file. At this point, the runtime is polling and
+    // we're about to block on accept(), so we're truly ready.
+    let ready_path = crate::daemon::lifecycle::ready_path()?;
+    std::fs::write(&ready_path, "")?;
+    tracing::info!("Daemon ready, wrote {}", ready_path.display());
 
     loop {
         let (stream, _addr) = listener.accept().await?;
@@ -137,7 +148,7 @@ async fn handle_connection(
 ///
 /// QUIT calls `process::exit(0)` which never returns; `None` is the logical
 /// sentinel but is never actually observed by the caller.
-#[allow(clippy::unnecessary_wraps)]
+#[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
 fn dispatch(
     line: &str,
     state: &Arc<Mutex<DaemonState>>,
@@ -160,6 +171,49 @@ fn dispatch(
             let _ = audio_tx.send(AudioCommand::Stop);
             Some("OK\n".to_owned())
         }
+        "PLAY_PLACE" => {
+            if arg.is_empty() {
+                return Some("ERROR missing place location\n".to_owned());
+            }
+            let location = arg.to_owned();
+            let _ = audio_tx.send(AudioCommand::PlayPlace(location.clone()));
+            if let Ok(mut s) = state.lock() {
+                s.place_state = PlayState::Running;
+                s.place_location = Some(location);
+            }
+            Some("OK\n".to_owned())
+        }
+        "STOP_PLACE" => {
+            let _ = audio_tx.send(AudioCommand::StopPlace);
+            if let Ok(mut s) = state.lock() {
+                s.place_state = PlayState::Stopped;
+                s.place_location = None;
+            }
+            Some("OK\n".to_owned())
+        }
+        "SET_PLACE_VOLUME" => match arg.parse::<f32>() {
+            Ok(v) => {
+                let clamped = v.clamp(0.0, 1.0);
+                let _ = audio_tx.send(AudioCommand::SetPlaceVolume(clamped));
+                if let Ok(mut s) = state.lock() {
+                    s.place_volume = clamped;
+                }
+                Some("OK\n".to_owned())
+            }
+            Err(_) => Some("ERROR invalid place volume value\n".to_owned()),
+        },
+        "GET_PLACE_STATUS" => {
+            let response = if let Ok(s) = state.lock() {
+                let place = s.place_location.as_deref().unwrap_or("none");
+                format!(
+                    "PLACE_STATUS place={}:{}:{:.2}\n",
+                    place, s.place_state, s.place_volume
+                )
+            } else {
+                "ERROR state lock poisoned\n".to_owned()
+            };
+            Some(response)
+        }
         "SET_VOLUME" => {
             match arg.parse::<f32>() {
                 Ok(v) => {
@@ -174,11 +228,88 @@ fn dispatch(
                 Err(_) => Some("ERROR invalid volume value\n".to_owned()),
             }
         }
+        "SET_EQ" => {
+            let mut eq_parts = arg.splitn(2, ' ');
+            let band_str = eq_parts.next().unwrap_or("");
+            let gain_str = eq_parts.next().unwrap_or("").trim();
+
+            let Ok(band) = band_str.parse::<usize>() else {
+                return Some("ERROR invalid band index\n".to_owned());
+            };
+            if band >= N_BANDS {
+                return Some(format!("ERROR band index out of range (0..{N_BANDS})\n"));
+            }
+            let gain = match gain_str.parse::<f32>() {
+                Ok(g) if !g.is_nan() => g.clamp(GAIN_MIN, GAIN_MAX),
+                _ => return Some("ERROR invalid gain value\n".to_owned()),
+            };
+
+            let full_gains = if let Ok(mut s) = state.lock() {
+                s.eq_gains[band] = gain;
+                s.eq_gains
+            } else {
+                return Some("ERROR state lock poisoned\n".to_owned());
+            };
+            let _ = audio_tx.send(AudioCommand::SetEq(full_gains));
+            Some("OK\n".to_owned())
+        }
+        "SET_PLACE_EQ" => {
+            let mut eq_parts = arg.splitn(2, ' ');
+            let band_str = eq_parts.next().unwrap_or("");
+            let gain_str = eq_parts.next().unwrap_or("").trim();
+
+            let Ok(band) = band_str.parse::<usize>() else {
+                return Some("ERROR invalid band index\n".to_owned());
+            };
+            if band >= N_BANDS {
+                return Some(format!("ERROR band index out of range (0..{N_BANDS})\n"));
+            }
+            let gain = match gain_str.parse::<f32>() {
+                Ok(g) if !g.is_nan() => g.clamp(GAIN_MIN, GAIN_MAX),
+                _ => return Some("ERROR invalid gain value\n".to_owned()),
+            };
+
+            let full_gains = if let Ok(mut s) = state.lock() {
+                s.place_eq_gains[band] = gain;
+                s.place_eq_gains
+            } else {
+                return Some("ERROR state lock poisoned\n".to_owned());
+            };
+            let _ = audio_tx.send(AudioCommand::SetPlaceEq(full_gains));
+            Some("OK\n".to_owned())
+        }
+        "GET_EQ" => {
+            if let Ok(s) = state.lock() {
+                let gains_str = s
+                    .eq_gains
+                    .iter()
+                    .map(|&g| format!("{g:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Some(format!("EQ {gains_str}\n"))
+            } else {
+                Some("ERROR state lock poisoned\n".to_owned())
+            }
+        }
+        "GET_PLACE_EQ" => {
+            if let Ok(s) = state.lock() {
+                let gains_str = s
+                    .place_eq_gains
+                    .iter()
+                    .map(|&g| format!("{g:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Some(format!("PLACE_EQ {gains_str}\n"))
+            } else {
+                Some("ERROR state lock poisoned\n".to_owned())
+            }
+        }
         "STATUS" => {
             let response = if let Ok(s) = state.lock() {
+                let place = s.place_location.as_deref().unwrap_or("none");
                 format!(
-                    "STATUS {} preset={} volume={:.2}\n",
-                    s.play_state, s.preset, s.volume
+                    "STATUS synth={}:{}:{:.2} place={}:{}:{:.2}\n",
+                    s.preset, s.play_state, s.volume, place, s.place_state, s.place_volume
                 )
             } else {
                 "ERROR state lock poisoned\n".to_owned()
@@ -188,6 +319,7 @@ fn dispatch(
         "QUIT" => {
             let _ = audio_tx.send(AudioCommand::Shutdown);
             remove_pid_file();
+            remove_ready_file();
             let _ = std::fs::remove_file(socket_path);
             std::process::exit(0);
         }
