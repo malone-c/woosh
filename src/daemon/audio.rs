@@ -48,6 +48,8 @@ pub struct NoiseSource {
     local_batch: Vec<f32>,
     /// Shared buffer read by the IPC broadcast task.
     sample_buf: Option<Arc<Mutex<Vec<f32>>>>,
+    /// Counter for 1.5 s fade-in (0 → 66_150 samples at 44_100 Hz).
+    fade_samples: u32,
 }
 
 impl NoiseSource {
@@ -69,6 +71,7 @@ impl NoiseSource {
             algorithm,
             local_batch: Vec::with_capacity(512),
             sample_buf,
+            fade_samples: 0,
         }
     }
 
@@ -116,7 +119,9 @@ impl Iterator for NoiseSource {
             }
         };
 
-        let sample = raw * self.volume;
+        let fade = (self.fade_samples as f32 / 66_150.0).min(1.0);
+        self.fade_samples = self.fade_samples.saturating_add(1).min(66_150);
+        let sample = raw * self.volume * fade;
 
         if self.sample_buf.is_some() {
             self.local_batch.push(sample);
@@ -290,6 +295,10 @@ mod tests {
     #[test]
     fn white_noise_statistics() {
         let mut src = NoiseSource::new(NoisePreset::White, 1.0, None);
+        // Skip past the 1.5 s fade ramp so statistics reflect full-amplitude noise.
+        for _ in 0..66_150 {
+            let _ = src.next();
+        }
         let samples: Vec<f32> = (0..10_000).map(|_| src.next().unwrap()).collect();
         let mean: f32 = samples.iter().sum::<f32>() / 10_000.0;
         let variance: f32 = samples.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / 10_000.0;

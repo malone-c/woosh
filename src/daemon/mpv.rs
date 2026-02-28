@@ -24,6 +24,8 @@ pub struct MpvSource {
     child: Child,
     buffer: Arc<Mutex<VecDeque<f32>>>,
     reader_done: Arc<AtomicBool>,
+    /// Counter for 1.5 s fade-in (0 → 66_150 samples at 44_100 Hz).
+    fade_samples: u32,
 }
 
 impl MpvSource {
@@ -96,6 +98,7 @@ impl MpvSource {
             child,
             buffer,
             reader_done,
+            fade_samples: 0,
         })
     }
 }
@@ -105,16 +108,25 @@ impl Iterator for MpvSource {
 
     /// Non-blocking: returns silence while mpv is still buffering, `None` only after exit.
     fn next(&mut self) -> Option<f32> {
-        if let Ok(mut guard) = self.buffer.try_lock() {
+        let raw = if let Ok(mut guard) = self.buffer.try_lock() {
             if let Some(sample) = guard.pop_front() {
-                return Some(sample);
+                sample
+            } else {
+                if self.reader_done.load(Ordering::Acquire) {
+                    return None;
+                }
+                // Silence while mpv hasn't produced data yet.
+                0.0
             }
-        }
-        if self.reader_done.load(Ordering::Acquire) {
-            return None;
-        }
-        // Silence while mpv hasn't produced data yet.
-        Some(0.0)
+        } else {
+            if self.reader_done.load(Ordering::Acquire) {
+                return None;
+            }
+            0.0
+        };
+        let fade = (self.fade_samples as f32 / 66_150.0).min(1.0);
+        self.fade_samples = self.fade_samples.saturating_add(1).min(66_150);
+        Some(raw * fade)
     }
 }
 
