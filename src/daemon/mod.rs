@@ -8,7 +8,7 @@ pub mod state;
 use anyhow::Result;
 use audio::AudioCommand;
 use eq::N_BANDS;
-use state::{DaemonState, NoisePreset};
+use state::DaemonState;
 use std::sync::{Arc, Mutex};
 
 /// Start the audio daemon.
@@ -44,14 +44,8 @@ pub fn start(no_daemonize: bool) -> Result<()> {
 
     // Load config; fall back to defaults on any error.
     let config = crate::config::load().unwrap_or_default();
-    let initial_preset = config
-        .defaults
-        .preset
-        .parse::<NoisePreset>()
-        .unwrap_or(NoisePreset::White);
 
     let state: Arc<Mutex<DaemonState>> = Arc::new(Mutex::new(DaemonState {
-        preset: initial_preset,
         volume: config.defaults.volume,
         ..DaemonState::default()
     }));

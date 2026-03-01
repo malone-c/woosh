@@ -47,7 +47,7 @@ async fn status_returns_current_state() {
     let mut lines = BufReader::new(reader).lines();
     let line = lines.next_line().await.unwrap().unwrap();
     assert!(line.starts_with("STATUS "), "got: {line}");
-    assert!(line.contains("synth=white:running:0.80"), "got: {line}");
+    assert!(line.contains("synth=none:stopped:0.80"), "got: {line}");
     assert!(line.contains("place=none:stopped:0.40"), "got: {line}");
 }
 

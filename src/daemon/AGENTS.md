@@ -12,7 +12,7 @@ Seven modules implement the daemon: orchestration, lifecycle, state, IPC server,
 |---------------|-------|-----------------------------------------------------------------------------|
 | mod.rs        | 79    | Orchestrator: creates shared Arcs, spawns audio thread, runs tokio runtime  |
 | lifecycle.rs  | 140   | PID/socket/ready-file paths, daemonize(), daemon_is_alive(), init_logging() |
-| state.rs      | 83    | NoisePreset (White/Pink/Brown), PlayState, DaemonState struct               |
+| state.rs      | 83    | NoisePreset (White/Pink/Brown), PlayState, DaemonState struct; preset is Option<NoisePreset>, default Stopped/None |
 | ipc.rs        | 328   | UnixListener, dispatch() command router, broadcast_task() every 33ms        |
 | audio.rs      | 415   | spawn_audio_thread(), NoiseSource generators, AudioCommand enum             |
 | eq.rs         | 201   | BiquadCoeffs, BiquadState, peaking_coeffs(), apply_biquad(), EqProcessor   |
@@ -22,7 +22,7 @@ Seven modules implement the daemon: orchestration, lifecycle, state, IPC server,
 
 Four shared objects wired at startup in mod.rs and passed into IPC + audio:
 
-- `Arc<Mutex<DaemonState>>` — all IPC state reads/writes (preset, volume, play state)
+- `Arc<Mutex<DaemonState>>` — all IPC state reads/writes (preset: `Option<NoisePreset>`, volume, play state; defaults to `Stopped`/`None`)
 - `Arc<Mutex<Vec<f32>>>` — sample_buf: NoiseSource batches 512 samples → broadcast_task drains every 33ms → `"SAMPLES <hex>\n"` to subscribers
 - `Arc<Mutex<[f32; 10]>>` eq_arc — synth EQ gains; read by EqProcessor every 512 samples
 - `Arc<Mutex<[f32; 10]>>` place_eq_arc — place-audio EQ gains; separate from eq_arc
@@ -35,6 +35,7 @@ Four shared objects wired at startup in mod.rs and passed into IPC + audio:
 - Every 512 samples, NoiseSource calls `try_lock` on sample_buf; skips on contention — never blocks.
 - `AudioCommand` variants: `Play`, `Stop`, `SetVolume`, `SetEq`, `PlayPlace`, `StopPlace`, `SetPlaceVolume`, `Shutdown`.
 - EqProcessor wraps NoiseSource in the rodio sink; also polls eq_gains via `try_lock` every 512 samples.
+- **Startup:** The sink is created empty — no `NoiseSource` is appended at startup. The daemon starts in `PlayState::Stopped` with `preset: None`. Audio only begins on the first `Play` command.
 - **Fade-in:** Both `NoiseSource` and `MpvSource` ramp from 0 → 1.0 over 66,150 samples (1.5 s at 44,100 Hz) via `fade_samples` counter. Resets automatically when sources are recreated on `Play`/`PlayPlace`.
 - **Fade-out:** Each source holds a shared `Arc<AtomicBool>` (`fade_out`) and a `fade_out_samples: u32` counter. `Stop` sets the noise flag; `StopPlace` sets the place flag. The source then ramps 1.0 → 0.0 over 66,150 samples and returns `None` — rodio drains the sink naturally. `Play`/`PlayPlace` create a fresh `Arc<AtomicBool>`, so the old fade-out is abandoned when the sink is dropped.
 

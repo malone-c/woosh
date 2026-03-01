@@ -306,10 +306,11 @@ fn dispatch(
         }
         "STATUS" => {
             let response = if let Ok(s) = state.lock() {
+                let preset = s.preset.map_or("none".to_owned(), |p| p.to_string());
                 let place = s.place_location.as_deref().unwrap_or("none");
                 format!(
                     "STATUS synth={}:{}:{:.2} place={}:{}:{:.2}\n",
-                    s.preset, s.play_state, s.volume, place, s.place_state, s.place_volume
+                    preset, s.play_state, s.volume, place, s.place_state, s.place_volume
                 )
             } else {
                 "ERROR state lock poisoned\n".to_owned()

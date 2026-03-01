@@ -248,10 +248,10 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 **Desired behaviour:** Daemon starts in a fully stopped state. The Preset Selector screen opens with no noise playing. The user presses `Enter` to start a preset for the first time.
 
-- [ ] Remove the initial `sink.append(NoiseSource::new(...))` call from `spawn_audio_thread`; start with an empty, paused sink (or no sink until the first `PLAY` command)
-- [ ] Update `DaemonState` initial `play_state` from `Running` → `Stopped`; clear `preset` default (use `Option<NoisePreset>`)
-- [ ] Update SPEC §Overview and §Audio Daemon to replace "launches the TUI with pink noise as default" → "launches the TUI in stopped state; user selects a preset to begin playback"
-- [ ] TUI Preset Selector: on first open show all three presets unselected; status indicator shows `stopped` until user presses `Enter`
+- [x] Remove the initial `sink.append(NoiseSource::new(...))` call from `spawn_audio_thread`; start with an empty, paused sink (or no sink until the first `PLAY` command)
+- [x] Update `DaemonState` initial `play_state` from `Running` → `Stopped`; clear `preset` default (use `Option<NoisePreset>`)
+- [x] Update SPEC §Overview and §Audio Daemon to replace "launches the TUI with pink noise as default" → "launches the TUI in stopped state; user selects a preset to begin playback"
+- [x] TUI Preset Selector: on first open show all three presets unselected; status indicator shows `stopped` until user presses `Enter`
 
 #### 3.5.4 — Extended IPC protocol for place sounds
 

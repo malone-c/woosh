@@ -53,7 +53,7 @@ impl fmt::Display for PlayState {
 #[derive(Debug)]
 pub struct DaemonState {
     pub play_state: PlayState,
-    pub preset: NoisePreset,
+    pub preset: Option<NoisePreset>,
     pub volume: f32,
     /// Per-band EQ gains in dB (−12..+12). Index 0 = 31 Hz … 9 = 16 kHz.
     pub eq_gains: [f32; N_BANDS],
@@ -70,8 +70,8 @@ pub struct DaemonState {
 impl Default for DaemonState {
     fn default() -> Self {
         Self {
-            play_state: PlayState::Running,
-            preset: NoisePreset::White,
+            play_state: PlayState::Stopped,
+            preset: None,
             volume: 0.8,
             eq_gains: [0.0f32; N_BANDS],
             place_state: PlayState::Stopped,

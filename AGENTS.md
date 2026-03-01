@@ -70,7 +70,7 @@ Newline-delimited text over Unix socket. Key commands:
 | `SET_PLACE_EQ` | `band gain_db` | `OK\n` |
 | `GET_PLACE_EQ` | — | `PLACE_EQ g0 ... g9\n` |
 | `GET_PLACE_STATUS` | — | `PLACE_STATUS place=loc:state:vol\n` |
-| `STATUS` | — | `STATUS synth=p:s:v place=p:s:v\n` |
+| `STATUS` | — | `STATUS synth=p:s:v place=p:s:v\n` (preset `p` is `none` when stopped before first play) |
 | `SUBSCRIBE_SAMPLES` | — | `OK\n` then pushed `SAMPLES <hex>\n` every 33ms |
 | `QUIT` | — | (daemon exits; no response) |
 

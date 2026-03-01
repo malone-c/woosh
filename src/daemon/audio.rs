@@ -199,23 +199,11 @@ pub fn spawn_audio_thread(
             }
         };
 
-        let (initial_preset, initial_volume) = state
-            .lock()
-            .map(|s| (s.preset, s.volume))
-            .unwrap_or((NoisePreset::White, 0.8));
+        let initial_volume = state.lock().map(|s| s.volume).unwrap_or(0.8);
         let mut fade_out_flag = Arc::new(AtomicBool::new(false));
         let mut place_fade_out_flag: Option<Arc<AtomicBool>> = None;
 
         let mut sink = rodio::Sink::try_new(&handle).expect("sink");
-        sink.append(EqProcessor::new(
-            NoiseSource::new(
-                initial_preset,
-                1.0,
-                Some(Arc::clone(&sample_buf)),
-                Arc::clone(&fade_out_flag),
-            ),
-            Arc::clone(&eq_arc),
-        ));
         sink.set_volume(initial_volume);
 
         let mut place_sink: Option<rodio::Sink> = None;
@@ -239,7 +227,7 @@ pub fn spawn_audio_thread(
                     sink.set_volume(volume);
                     if let Ok(mut s) = state.lock() {
                         s.play_state = PlayState::Running;
-                        s.preset = preset;
+                        s.preset = Some(preset);
                     }
                 }
                 Ok(AudioCommand::Stop) => {
