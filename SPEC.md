@@ -69,7 +69,7 @@ Woosh is a command-line ambient noise app written in Rust. It plays continuous s
 
 The single compiled binary (`woosh`) serves both roles:
 
-- **`woosh`** (no subcommand) — launches the TUI with pink noise as default. If no daemon is running, it spawns one in the background first.
+- **`woosh`** (no subcommand) — launches the TUI in a stopped state. If no daemon is running, it spawns one in the background first. No noise plays until the user selects a preset and presses `Enter`.
 - **`woosh pink|white|brown`** — quick command to play specific synthetic noise type without TUI, then exit.
 - **`woosh {place}`** — quick command to play YouTube place sound (e.g., `woosh paris`), then exit.
 - **`woosh daemon`** — starts the daemon in the foreground (used internally by the auto-spawn path).
@@ -176,9 +176,15 @@ If `mpv` or `yt-dlp` is missing, place sound commands gracefully fail with an er
 
 ### Fade-In
 
-All audio sources (synth noise and place sounds) **fade in over 1–2 seconds** when playback starts. This prevents sudden loud bursts that can be jarring.
+All audio sources (synth noise and place sounds) **fade in over 1.5 seconds** when playback starts. This prevents sudden loud bursts that can be jarring.
 
-**Implementation:** Linear volume ramp from `0.0` → `target_volume` over 66,150 samples at 44.1 kHz (≈ 1.5 seconds). Each sample is multiplied by `min(fade_progress, 1.0)` where `fade_progress` increments per sample. Fade resets when a new `PLAY` command is received.
+**Implementation:** `NoiseSource` and `MpvSource` each hold a `fade_samples: u32` counter (0 → 66,150). Each sample is multiplied by `min(fade_samples / 66_150.0, 1.0)` and the counter increments by 1 (capped at 66,150). Because sources are recreated on every `PLAY`/`PLAY_PLACE` command, the counter resets automatically.
+
+### Fade-Out
+
+When playback stops (via `STOP` or `STOP_PLACE`), audio **fades out over 1.5 seconds** before the source is silenced. This avoids abrupt cuts.
+
+**Implementation:** A `fade_out: bool` flag is set on the source; subsequent samples are multiplied by a linearly decreasing envelope (`1.0` → `0.0` over 66,150 samples). Once the counter reaches zero the source returns `None`, signalling end-of-stream to rodio, which then drops the sink.
 
 ### Volume Defaults
 
@@ -219,7 +225,8 @@ Reverb adds CPU overhead (mpv subprocess filter chain), so it defaults to disabl
 1. On first `woosh` invocation, the TUI checks for `woosh.pid`.
 2. If PID file absent or stale (process not alive), spawn `woosh daemon` as a detached child using `daemonize`.
 3. Wait up to 500 ms for the socket file to appear, then connect.
-4. On `QUIT` command or `SIGTERM`, flush audio, remove socket and PID file, exit.
+4. Daemon starts in a **stopped state** — no audio plays until the first `PLAY` command is received.
+5. On `QUIT` command or `SIGTERM`, flush audio, remove socket and PID file, exit.
 
 ### PID & Socket Paths
 

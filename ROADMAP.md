@@ -229,10 +229,29 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 #### 3.5.3 — Fade-in audio effect
 
-- [ ] Add `fade_progress` field to `NoiseSource` (0.0 → 1.0 over 66,150 samples at 44.1 kHz ≈ 1.5s)
-- [ ] Multiply each sample by `min(fade_progress, 1.0)` and increment fade counter per sample
-- [ ] Apply same fade logic to mpv PCM wrapper source
-- [ ] Reset fade counter when `PLAY` or `PLAY_PLACE` command received
+- [x] Add `fade_samples` field to `NoiseSource` (u32 counter, 0 → 66,150 at 44,100 Hz ≈ 1.5 s)
+- [x] Multiply each sample by `min(fade_samples / 66_150.0, 1.0)` and increment counter per sample
+- [x] Apply same fade logic to `MpvSource` (place sounds)
+- [x] Fade resets automatically on each `PLAY`/`PLAY_PLACE` because sources are recreated fresh
+
+#### 3.5.3b — Fade-out audio effect
+
+- [ ] Add `fade_out: bool` flag and `fade_out_samples: u32` counter to `NoiseSource`
+- [ ] On `STOP` command: set `fade_out = true` rather than calling `sink.pause()` immediately; let source ramp volume 1.0 → 0.0 over 66,150 samples, then return `None` to signal end of stream
+- [ ] Apply same fade-out logic to `MpvSource` (on `STOP_PLACE`)
+- [ ] After source yields `None`, pause/drop the sink as today (no change to downstream logic)
+- [ ] Unit test: collect samples after `fade_out` is triggered, confirm monotonically decreasing amplitude envelope
+
+#### 3.5.3c — No auto-play on daemon startup
+
+**Spec misalignment:** The daemon currently appends a `NoiseSource` to the sink immediately on startup, so noise plays the moment the TUI opens (or the daemon is spawned) rather than waiting for the user to make a selection.
+
+**Desired behaviour:** Daemon starts in a fully stopped state. The Preset Selector screen opens with no noise playing. The user presses `Enter` to start a preset for the first time.
+
+- [ ] Remove the initial `sink.append(NoiseSource::new(...))` call from `spawn_audio_thread`; start with an empty, paused sink (or no sink until the first `PLAY` command)
+- [ ] Update `DaemonState` initial `play_state` from `Running` → `Stopped`; clear `preset` default (use `Option<NoisePreset>`)
+- [ ] Update SPEC §Overview and §Audio Daemon to replace "launches the TUI with pink noise as default" → "launches the TUI in stopped state; user selects a preset to begin playback"
+- [ ] TUI Preset Selector: on first open show all three presets unselected; status indicator shows `stopped` until user presses `Enter`
 
 #### 3.5.4 — Extended IPC protocol for place sounds
 
@@ -285,7 +304,7 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 ### Exit Criteria
 
-User can play synthetic noise + YouTube place sound simultaneously with independent volumes. TUI displays centered, colorful layout with ASCII art. All sounds fade in smoothly. CLI shortcuts `woosh pink` and `woosh tokyo` work. EQ is default screen with spectrum as toggle.
+User can play synthetic noise + YouTube place sound simultaneously with independent volumes. TUI opens in a stopped state; noise only begins when the user explicitly selects a preset. All sounds fade in and fade out smoothly. TUI displays centered, colorful layout with ASCII art. CLI shortcuts `woosh pink` and `woosh tokyo` work. EQ is default screen with spectrum as toggle.
 
 ---
 
