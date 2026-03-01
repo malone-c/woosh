@@ -236,11 +236,11 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 #### 3.5.3b — Fade-out audio effect
 
-- [ ] Add `fade_out: bool` flag and `fade_out_samples: u32` counter to `NoiseSource`
-- [ ] On `STOP` command: set `fade_out = true` rather than calling `sink.pause()` immediately; let source ramp volume 1.0 → 0.0 over 66,150 samples, then return `None` to signal end of stream
-- [ ] Apply same fade-out logic to `MpvSource` (on `STOP_PLACE`)
-- [ ] After source yields `None`, pause/drop the sink as today (no change to downstream logic)
-- [ ] Unit test: collect samples after `fade_out` is triggered, confirm monotonically decreasing amplitude envelope
+- [x] Add `fade_out: Arc<AtomicBool>` flag and `fade_out_samples: u32` counter to `NoiseSource`
+- [x] On `STOP` command: set flag rather than calling `sink.pause()` immediately; source ramps volume 1.0 → 0.0 over 66,150 samples, then returns `None` to signal end of stream
+- [x] Apply same fade-out logic to `MpvSource` (on `STOP_PLACE`)
+- [x] After source yields `None`, rodio drains the sink naturally (no explicit drop required)
+- [x] Unit test: collect samples after `fade_out` is triggered, confirm RMS decreasing envelope (start > midpoint)
 
 #### 3.5.3c — No auto-play on daemon startup
 

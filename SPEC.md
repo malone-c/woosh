@@ -184,7 +184,7 @@ All audio sources (synth noise and place sounds) **fade in over 1.5 seconds** wh
 
 When playback stops (via `STOP` or `STOP_PLACE`), audio **fades out over 1.5 seconds** before the source is silenced. This avoids abrupt cuts.
 
-**Implementation:** A `fade_out: bool` flag is set on the source; subsequent samples are multiplied by a linearly decreasing envelope (`1.0` → `0.0` over 66,150 samples). Once the counter reaches zero the source returns `None`, signalling end-of-stream to rodio, which then drops the sink.
+**Implementation:** `NoiseSource` and `MpvSource` each hold a shared `fade_out: Arc<AtomicBool>` flag and a `fade_out_samples: u32` counter. When the audio thread receives `STOP`/`STOP_PLACE`, it sets the flag via the shared Arc. Subsequent samples are then multiplied by a linearly decreasing envelope (`1.0 − fade_out_samples / 66_150.0`). Once `fade_out_samples` reaches 66,150 the source returns `None`, signalling end-of-stream to rodio; the sink drains naturally without an explicit pause or drop.
 
 ### Volume Defaults
 

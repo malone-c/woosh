@@ -91,7 +91,7 @@ Single Cargo package with `[lib]` + `[[bin]]`. Integration tests `use woosh::dae
 
 ```bash
 cargo check --all-targets          # Type-check (fast)
-cargo test --all-targets           # All 26 tests (15 unit + 11 integration)
+cargo test --all-targets           # All 33 tests (16 unit + 17 integration)
 cargo run -- daemon --no-daemonize # Run daemon in foreground for dev
 cargo run -- status                # Verify daemon reachable
 cargo run -- stop                  # Stop daemon
@@ -112,7 +112,6 @@ printf 'STATUS\nGET_EQ\n' | nc -U "$SOCK"
 - Never touch audio thread threading model (rodio `!Send` requires `std::thread`).
 - Never reset BiquadState on EQ coefficient change (causes clicks).
 - When adding IPC commands: update `tests/ipc_integration.rs` in the same commit.
-- After completing work: update `ROADMAP.md` checkboxes and `SPEC.md` protocol docs.
 
 ## FAST TRIAGE
 
@@ -122,3 +121,7 @@ printf 'STATUS\nGET_EQ\n' | nc -U "$SOCK"
 | `daemon is already running` | Stale PID | `cargo run -- stop`, retry |
 | Clippy pedantic error | Unnecessarily nested or-patterns | Use `Char('q' \| 'Q')` not two arms |
 | IPC test prints nothing | Server not yet bound | Add 20ms sleep after spawn |
+
+# Workflow
+
+  * Whenever a unit of work is completed, always update @ROADMAP.md, and if necessary, @SPEC.md, the root folder's AGENTS.md, or the AGENTS.md file in the folder where code changes were made.

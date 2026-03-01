@@ -5,6 +5,7 @@ use rand::distributions::{Distribution, Uniform};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use rodio::Source;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -50,6 +51,10 @@ pub struct NoiseSource {
     sample_buf: Option<Arc<Mutex<Vec<f32>>>>,
     /// Counter for 1.5 s fade-in (0 → 66_150 samples at 44_100 Hz).
     fade_samples: u32,
+    /// Shared flag; set to `true` by the audio thread to trigger fade-out.
+    fade_out: Arc<AtomicBool>,
+    /// Counter for 1.5 s fade-out (0 → 66_150 samples at 44_100 Hz).
+    fade_out_samples: u32,
 }
 
 impl NoiseSource {
@@ -58,7 +63,12 @@ impl NoiseSource {
     /// # Panics
     /// Panics if the system RNG cannot be seeded.
     #[must_use]
-    pub fn new(preset: NoisePreset, volume: f32, sample_buf: Option<Arc<Mutex<Vec<f32>>>>) -> Self {
+    pub fn new(
+        preset: NoisePreset,
+        volume: f32,
+        sample_buf: Option<Arc<Mutex<Vec<f32>>>>,
+        fade_out: Arc<AtomicBool>,
+    ) -> Self {
         let algorithm = match preset {
             NoisePreset::White => NoiseAlgorithm::White,
             NoisePreset::Pink => NoiseAlgorithm::Pink { b: [0.0; 7] },
@@ -72,6 +82,8 @@ impl NoiseSource {
             local_batch: Vec::with_capacity(512),
             sample_buf,
             fade_samples: 0,
+            fade_out,
+            fade_out_samples: 0,
         }
     }
 
@@ -119,9 +131,22 @@ impl Iterator for NoiseSource {
             }
         };
 
-        let fade = (self.fade_samples as f32 / 66_150.0).min(1.0);
+        let fade_in = (self.fade_samples as f32 / 66_150.0).min(1.0);
         self.fade_samples = self.fade_samples.saturating_add(1).min(66_150);
-        let sample = raw * self.volume * fade;
+
+        let fade_out = if self.fade_out.load(Ordering::Relaxed) {
+            let t = self.fade_out_samples as f32 / 66_150.0;
+            let fo = 1.0 - t;
+            if fo <= 0.0 {
+                return None;
+            }
+            self.fade_out_samples += 1;
+            fo
+        } else {
+            1.0
+        };
+
+        let sample = raw * self.volume * fade_in * fade_out;
 
         if self.sample_buf.is_some() {
             self.local_batch.push(sample);
@@ -178,9 +203,17 @@ pub fn spawn_audio_thread(
             .lock()
             .map(|s| (s.preset, s.volume))
             .unwrap_or((NoisePreset::White, 0.8));
+        let mut fade_out_flag = Arc::new(AtomicBool::new(false));
+        let mut place_fade_out_flag: Option<Arc<AtomicBool>> = None;
+
         let mut sink = rodio::Sink::try_new(&handle).expect("sink");
         sink.append(EqProcessor::new(
-            NoiseSource::new(initial_preset, 1.0, Some(Arc::clone(&sample_buf))),
+            NoiseSource::new(
+                initial_preset,
+                1.0,
+                Some(Arc::clone(&sample_buf)),
+                Arc::clone(&fade_out_flag),
+            ),
             Arc::clone(&eq_arc),
         ));
         sink.set_volume(initial_volume);
@@ -191,9 +224,15 @@ pub fn spawn_audio_thread(
             match rx.recv() {
                 Ok(AudioCommand::Play(preset)) => {
                     drop(sink);
+                    fade_out_flag = Arc::new(AtomicBool::new(false));
                     sink = rodio::Sink::try_new(&handle).expect("sink");
                     sink.append(EqProcessor::new(
-                        NoiseSource::new(preset, 1.0, Some(Arc::clone(&sample_buf))),
+                        NoiseSource::new(
+                            preset,
+                            1.0,
+                            Some(Arc::clone(&sample_buf)),
+                            Arc::clone(&fade_out_flag),
+                        ),
                         Arc::clone(&eq_arc),
                     ));
                     let volume = state.lock().map(|s| s.volume).unwrap_or(0.8);
@@ -204,7 +243,7 @@ pub fn spawn_audio_thread(
                     }
                 }
                 Ok(AudioCommand::Stop) => {
-                    sink.pause();
+                    fade_out_flag.store(true, Ordering::Release);
                     if let Ok(mut s) = state.lock() {
                         s.play_state = PlayState::Stopped;
                     }
@@ -223,7 +262,8 @@ pub fn spawn_audio_thread(
                 }
                 Ok(AudioCommand::PlayPlace(location)) => {
                     place_sink = None; // kills old mpv via MpvSource::drop
-                    match MpvSource::spawn(&location) {
+                    let flag = Arc::new(AtomicBool::new(false));
+                    match MpvSource::spawn(&location, Arc::clone(&flag)) {
                         Err(e) => {
                             tracing::error!("audio: mpv spawn failed for {location:?}: {e}");
                             if let Ok(mut s) = state.lock() {
@@ -250,13 +290,16 @@ pub fn spawn_audio_thread(
                                     s.place_state = PlayState::Running;
                                     s.place_location = Some(location);
                                 }
+                                place_fade_out_flag = Some(flag);
                                 place_sink = Some(new_sink);
                             }
                         },
                     }
                 }
                 Ok(AudioCommand::StopPlace) => {
-                    place_sink = None;
+                    if let Some(ref flag) = place_fade_out_flag {
+                        flag.store(true, Ordering::Release);
+                    }
                     if let Ok(mut s) = state.lock() {
                         s.place_state = PlayState::Stopped;
                         s.place_location = None;
@@ -291,10 +334,11 @@ pub fn spawn_audio_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn white_noise_statistics() {
-        let mut src = NoiseSource::new(NoisePreset::White, 1.0, None);
+        let mut src = NoiseSource::new(NoisePreset::White, 1.0, None, Arc::new(AtomicBool::new(false)));
         // Skip past the 1.5 s fade ramp so statistics reflect full-amplitude noise.
         for _ in 0..66_150 {
             let _ = src.next();
@@ -310,7 +354,7 @@ mod tests {
 
     #[test]
     fn pink_noise_in_range() {
-        let mut src = NoiseSource::new(NoisePreset::Pink, 1.0, None);
+        let mut src = NoiseSource::new(NoisePreset::Pink, 1.0, None, Arc::new(AtomicBool::new(false)));
         let samples: Vec<f32> = (0..44_100).map(|_| src.next().unwrap()).collect();
         #[allow(clippy::cast_precision_loss)]
         let mean: f32 = samples.iter().sum::<f32>() / samples.len() as f32;
@@ -324,11 +368,47 @@ mod tests {
 
     #[test]
     fn brown_noise_clamped() {
-        let mut src = NoiseSource::new(NoisePreset::Brown, 1.0, None);
+        let mut src = NoiseSource::new(NoisePreset::Brown, 1.0, None, Arc::new(AtomicBool::new(false)));
         let samples: Vec<f32> = (0..10_000).map(|_| src.next().unwrap()).collect();
         assert!(
             samples.iter().all(|&s| (-1.0..=1.0).contains(&s)),
             "brown noise not clamped to [-1, 1]"
+        );
+    }
+
+    #[test]
+    fn noise_source_fade_out() {
+        let fade_out = Arc::new(AtomicBool::new(false));
+        let mut src =
+            NoiseSource::new(NoisePreset::White, 1.0, None, Arc::clone(&fade_out));
+
+        // Skip past the 1.5 s fade-in ramp so the source is at full amplitude.
+        for _ in 0..66_150 {
+            src.next().unwrap();
+        }
+
+        // Trigger fade-out.
+        fade_out.store(true, Ordering::Release);
+
+        // Collect every sample until the source terminates.
+        let samples: Vec<f32> = std::iter::from_fn(|| src.next()).collect();
+
+        // The ramp runs for exactly 66_150 samples before returning None.
+        assert_eq!(
+            samples.len(),
+            66_150,
+            "expected 66_150 fade-out samples, got {}",
+            samples.len()
+        );
+
+        // Envelope should be decreasing: RMS near the start > RMS near the midpoint.
+        let start_rms =
+            (samples[..1_000].iter().map(|s| s * s).sum::<f32>() / 1_000.0).sqrt();
+        let mid_rms =
+            (samples[32_575..33_575].iter().map(|s| s * s).sum::<f32>() / 1_000.0).sqrt();
+        assert!(
+            mid_rms < start_rms,
+            "fade-out envelope not decreasing: start_rms={start_rms}, mid_rms={mid_rms}"
         );
     }
 }

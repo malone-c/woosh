@@ -26,6 +26,10 @@ pub struct MpvSource {
     reader_done: Arc<AtomicBool>,
     /// Counter for 1.5 s fade-in (0 → 66_150 samples at 44_100 Hz).
     fade_samples: u32,
+    /// Shared flag; set to `true` by the audio thread to trigger fade-out.
+    fade_out: Arc<AtomicBool>,
+    /// Counter for 1.5 s fade-out (0 → 66_150 samples at 44_100 Hz).
+    fade_out_samples: u32,
 }
 
 impl MpvSource {
@@ -37,7 +41,7 @@ impl MpvSource {
     /// # Panics
     /// Panics if the child process stdout handle cannot be taken (should never happen
     /// because stdout is set to `Stdio::piped()`).
-    pub fn spawn(location: &str) -> anyhow::Result<Self> {
+    pub fn spawn(location: &str, fade_out: Arc<AtomicBool>) -> anyhow::Result<Self> {
         let query = format!("ytsearch1:walking through {location}");
 
         let mut child = Command::new("mpv")
@@ -99,6 +103,8 @@ impl MpvSource {
             buffer,
             reader_done,
             fade_samples: 0,
+            fade_out,
+            fade_out_samples: 0,
         })
     }
 }
@@ -124,9 +130,22 @@ impl Iterator for MpvSource {
             }
             0.0
         };
-        let fade = (self.fade_samples as f32 / 66_150.0).min(1.0);
+        let fade_in = (self.fade_samples as f32 / 66_150.0).min(1.0);
         self.fade_samples = self.fade_samples.saturating_add(1).min(66_150);
-        Some(raw * fade)
+
+        let fade_out = if self.fade_out.load(Ordering::Relaxed) {
+            let t = self.fade_out_samples as f32 / 66_150.0;
+            let fo = 1.0 - t;
+            if fo <= 0.0 {
+                return None;
+            }
+            self.fade_out_samples += 1;
+            fo
+        } else {
+            1.0
+        };
+
+        Some(raw * fade_in * fade_out)
     }
 }
 
