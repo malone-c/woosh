@@ -276,9 +276,9 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 #### 3.5.6b — Eliminate fade counter precision casts
 
-- [ ] Change `fade_samples` and `fade_out_samples` fields in `NoiseSource` and `MpvSource` from `u32` to `f32` — removes the `cast_precision_loss` `#[allow]` workarounds added in 3.5.3b/3.5.3c and makes the fade arithmetic self-documenting (the counter is already a fraction, not a sample index)
-- [ ] Update arithmetic sites: `saturating_add` → direct increment (`+= 1.0`), `.min(66_150)` → `.min(66_150.0)`
-- [ ] Remove `#[allow(clippy::cast_precision_loss)]` attributes from both files
+- [x] Change `fade_samples` and `fade_out_samples` fields in `NoiseSource` and `MpvSource` from `u32` to `f32` — removes the `cast_precision_loss` `#[allow]` workarounds added in 3.5.3b/3.5.3c and makes the fade arithmetic self-documenting (the counter is already a fraction, not a sample index)
+- [x] Update arithmetic sites: `saturating_add` → direct increment (`+= 1.0`), `.min(66_150)` → `.min(66_150.0)`
+- [x] Remove `#[allow(clippy::cast_precision_loss)]` attributes from both files
 
 #### 3.5.7 — ASCII art and dithered backgrounds
 

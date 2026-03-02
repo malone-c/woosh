@@ -49,12 +49,16 @@ pub struct NoiseSource {
     local_batch: Vec<f32>,
     /// Shared buffer read by the IPC broadcast task.
     sample_buf: Option<Arc<Mutex<Vec<f32>>>>,
-    /// Counter for 1.5 s fade-in (0 → `66_150` samples at `44_100` Hz).
-    fade_samples: u32,
+    /// Counter for 1.5 s fade-in (0.0 → `66_150.0` samples at `44_100` Hz).
+    /// Stored as `f32` (not `u32`) so arithmetic stays in one type and avoids
+    /// `cast_precision_loss` lints — the counter never exceeds 66_150 so there
+    /// is no precision difference in practice.
+    fade_samples: f32,
     /// Shared flag; set to `true` by the audio thread to trigger fade-out.
     fade_out: Arc<AtomicBool>,
-    /// Counter for 1.5 s fade-out (0 → `66_150` samples at `44_100` Hz).
-    fade_out_samples: u32,
+    /// Counter for 1.5 s fade-out (0.0 → `66_150.0` samples at `44_100` Hz).
+    /// Same rationale as `fade_samples`.
+    fade_out_samples: f32,
 }
 
 impl NoiseSource {
@@ -81,9 +85,9 @@ impl NoiseSource {
             algorithm,
             local_batch: Vec::with_capacity(512),
             sample_buf,
-            fade_samples: 0,
+            fade_samples: 0.0,
             fade_out,
-            fade_out_samples: 0,
+            fade_out_samples: 0.0,
         }
     }
 
@@ -131,18 +135,16 @@ impl Iterator for NoiseSource {
             }
         };
 
-        #[allow(clippy::cast_precision_loss)]
-        let fade_in = (self.fade_samples as f32 / 66_150.0).min(1.0);
-        self.fade_samples = self.fade_samples.saturating_add(1).min(66_150);
+        let fade_in = (self.fade_samples / 66_150.0).min(1.0);
+        self.fade_samples = (self.fade_samples + 1.0).min(66_150.0);
 
         let fade_out = if self.fade_out.load(Ordering::Relaxed) {
-            #[allow(clippy::cast_precision_loss)]
-            let t = self.fade_out_samples as f32 / 66_150.0;
+            let t = self.fade_out_samples / 66_150.0;
             let fo = 1.0 - t;
             if fo <= 0.0 {
                 return None;
             }
-            self.fade_out_samples += 1;
+            self.fade_out_samples += 1.0;
             fo
         } else {
             1.0
