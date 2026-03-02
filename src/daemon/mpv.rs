@@ -24,11 +24,11 @@ pub struct MpvSource {
     child: Child,
     buffer: Arc<Mutex<VecDeque<f32>>>,
     reader_done: Arc<AtomicBool>,
-    /// Counter for 1.5 s fade-in (0 → 66_150 samples at 44_100 Hz).
+    /// Counter for 1.5 s fade-in (0 → `66_150` samples at `44_100` Hz).
     fade_samples: u32,
     /// Shared flag; set to `true` by the audio thread to trigger fade-out.
     fade_out: Arc<AtomicBool>,
-    /// Counter for 1.5 s fade-out (0 → 66_150 samples at 44_100 Hz).
+    /// Counter for 1.5 s fade-out (0 → `66_150` samples at `44_100` Hz).
     fade_out_samples: u32,
 }
 
@@ -130,10 +130,12 @@ impl Iterator for MpvSource {
             }
             0.0
         };
+        #[allow(clippy::cast_precision_loss)]
         let fade_in = (self.fade_samples as f32 / 66_150.0).min(1.0);
         self.fade_samples = self.fade_samples.saturating_add(1).min(66_150);
 
         let fade_out = if self.fade_out.load(Ordering::Relaxed) {
+            #[allow(clippy::cast_precision_loss)]
             let t = self.fade_out_samples as f32 / 66_150.0;
             let fo = 1.0 - t;
             if fo <= 0.0 {

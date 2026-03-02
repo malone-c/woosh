@@ -255,24 +255,30 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 #### 3.5.4 — Extended IPC protocol for place sounds
 
-- [ ] Add commands: `PLAY_PLACE <location>`, `STOP_PLACE`, `SET_PLACE_VOLUME <f32>`, `GET_PLACE_STATUS`
-- [ ] Add `SET_PLACE_EQ <band> <gain_db>` and `GET_PLACE_EQ` (10-band EQ for place channel)
-- [ ] Update `STATUS` response to include both channels: `STATUS synth=pink:playing:0.5 place=paris:playing:0.4`
-- [ ] Handle `PLAY_PLACE` conflicts: stop old place before starting new
+- [x] Add commands: `PLAY_PLACE <location>`, `STOP_PLACE`, `SET_PLACE_VOLUME <f32>`, `GET_PLACE_STATUS`
+- [x] Add `SET_PLACE_EQ <band> <gain_db>` and `GET_PLACE_EQ` (10-band EQ for place channel)
+- [x] Update `STATUS` response to include both channels: `STATUS synth=pink:playing:0.5 place=paris:playing:0.4`
+- [x] Handle `PLAY_PLACE` conflicts: stop old place before starting new
 
 #### 3.5.5 — CLI shortcuts for quick commands
 
-- [ ] Implement `woosh pink|white|brown` shortcuts (connect to daemon, send `PLAY`, exit)
-- [ ] Implement `woosh {place}` detection (non-keyword args send `PLAY_PLACE`, exit)
-- [ ] Update `main.rs` CLI parser to route these before TUI launch
-- [ ] Change default to `pink` when no args (was `white`)
+- [x] Implement `woosh pink|white|brown` shortcuts (connect to daemon, send `PLAY`, exit)
+- [x] Implement `woosh place <name>` subcommand (multi-word names work without quotes, sends `PLAY_PLACE`, exit)
+- [x] Update `main.rs` CLI parser to route these before TUI launch
+- [x] Change default to `pink` when no args — moot; `woosh` opens TUI in stopped state (Pink is index 0 in preset list)
 
 #### 3.5.6 — TUI centered layout with colors
 
-- [ ] Modify `tui/mod.rs` render loop to create centered `Rect` (max 80 cols × 24 rows) with padding
-- [ ] Add colored border using `Block::default().borders(Borders::ALL).border_style(Style::fg(Color::Cyan))`
-- [ ] Create layout: Title bar (3 rows) + Main content (16 rows) + Footer (2 rows) + Status bar (1 row)
-- [ ] Apply RGB color palette (blues, purples, pinks) throughout TUI
+- [x] Modify `tui/mod.rs` render loop to create centered `Rect` (max 80 cols × 24 rows) with padding
+- [x] Add colored border using `Block::default().borders(Borders::ALL).border_style(Style::fg(Color::Cyan))`
+- [x] Create layout: Title bar (3 rows) + Main content (16 rows) + Footer (2 rows) + Status bar (1 row)
+- [x] Apply RGB color palette (blues, purples, pinks) throughout TUI
+
+#### 3.5.6b — Eliminate fade counter precision casts
+
+- [ ] Change `fade_samples` and `fade_out_samples` fields in `NoiseSource` and `MpvSource` from `u32` to `f32` — removes the `cast_precision_loss` `#[allow]` workarounds added in 3.5.3b/3.5.3c and makes the fade arithmetic self-documenting (the counter is already a fraction, not a sample index)
+- [ ] Update arithmetic sites: `saturating_add` → direct increment (`+= 1.0`), `.min(66_150)` → `.min(66_150.0)`
+- [ ] Remove `#[allow(clippy::cast_precision_loss)]` attributes from both files
 
 #### 3.5.7 — ASCII art and dithered backgrounds
 
@@ -396,3 +402,8 @@ Phase 0 → Phase 1 → Phase 2 → Phase 3
 ```
 
 Each phase depends strictly on the previous. Phases 3, 4, and 5 can be developed concurrently once Phase 2 is complete.
+
+
+# NOTE
+
+If you are updating this file because a task has been completed, ask yourself: should I also update @SPEC.md or any of the AGENTS.md files in the source code folders or root? Could this change have made those files stale? If so, update them.

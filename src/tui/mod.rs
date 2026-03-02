@@ -8,9 +8,9 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 use spectrum_analyzer::windows::hann_window;
@@ -24,6 +24,19 @@ use crate::daemon::state::{NoisePreset, PlayState};
 
 const FFT_SIZE: usize = 2048;
 const SAMPLE_WINDOW_CAP: usize = 4_096;
+
+const BORDER_CYAN:         Color = Color::Rgb(0, 210, 210);
+const TITLE_FG:            Color = Color::Rgb(200, 180, 255);
+const TITLE_BG:            Color = Color::Rgb(30, 20, 60);
+const FOOTER_FG:           Color = Color::Rgb(160, 130, 220);
+const STATUS_FG:           Color = Color::Rgb(120, 140, 170);
+const PRESET_HIGHLIGHT_BG: Color = Color::Rgb(60, 40, 120);
+const PRESET_HIGHLIGHT_FG: Color = Color::Rgb(240, 230, 255);
+const EQ_SELECTED_FG:      Color = Color::Rgb(210, 100, 255);
+const SPECTRUM_BAR_FG:     Color = Color::Rgb(80, 160, 255);
+const PLAYING_DOT_FG:      Color = Color::Rgb(0, 255, 180);
+const STOPPED_DOT_FG:      Color = Color::Rgb(90, 90, 110);
+const INNER_BORDER_FG:     Color = Color::Rgb(70, 60, 110);
 
 /// Entry point: run the TUI in a single-threaded Tokio runtime.
 ///
@@ -269,17 +282,114 @@ fn samples_to_bars(samples: &[f32], sample_rate: u32) -> [u64; NUM_BARS] {
     bars
 }
 
+// ── Layout helpers ─────────────────────────────────────────────────────────────
+
+fn centered_rect(area: Rect, max_w: u16, max_h: u16) -> Rect {
+    let w = area.width.min(max_w);
+    let h = area.height.min(max_h);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect::new(x, y, w, h)
+}
+
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
 fn render(frame: &mut ratatui::Frame, app: &App) {
+    let outer = centered_rect(frame.area(), 80, 24);
+    let outer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER_CYAN));
+    let inner = outer_block.inner(outer);
+    frame.render_widget(outer_block, outer);
+
+    let zones = Layout::vertical([
+        Constraint::Length(3),   // title bar
+        Constraint::Length(16),  // content
+        Constraint::Length(2),   // footer
+        Constraint::Length(1),   // status bar
+    ])
+    .split(inner);
+
+    render_title_bar(frame, app, zones[0]);
+    render_status_bar(frame, app, zones[3]);
+
     match app.screen {
-        Screen::Presets => render_presets(frame, app),
-        Screen::Visualizer => render_visualizer(frame, app),
-        Screen::Equalizer => render_eq(frame, app),
+        Screen::Presets    => { render_presets(frame, app, zones[1]);    render_footer_presets(frame, zones[2]); }
+        Screen::Visualizer => { render_visualizer(frame, app, zones[1]); render_footer_visualizer(frame, zones[2]); }
+        Screen::Equalizer  => { render_eq(frame, app, zones[1]);         render_footer_eq(frame, zones[2]); }
     }
 }
 
-fn render_presets(frame: &mut ratatui::Frame, app: &App) {
+fn render_title_bar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let dot_color = if app.play_state == PlayState::Running { PLAYING_DOT_FG } else { STOPPED_DOT_FG };
+    let status_dot = if app.play_state == PlayState::Running { "●" } else { "○" };
+    let preset_name = app.active_preset.map_or("—", |p| match p {
+        NoisePreset::White => "White",
+        NoisePreset::Pink => "Pink",
+        NoisePreset::Brown => "Brown",
+    });
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let vol_pct = (app.volume * 100.0).clamp(0.0, 100.0) as u8;
+    let screen_name = match app.screen {
+        Screen::Presets => "presets",
+        Screen::Visualizer => "visualizer",
+        Screen::Equalizer => "equalizer",
+    };
+
+    let title_line = Line::from(vec![
+        Span::styled(" WOOSH  ", Style::default().fg(TITLE_FG).add_modifier(Modifier::BOLD)),
+        Span::styled(status_dot, Style::default().fg(dot_color)),
+        Span::styled(format!(" {preset_name}  vol: {vol_pct}% "), Style::default().fg(TITLE_FG)),
+    ]);
+    let screen_line = Line::from(Span::styled(
+        format!(" {screen_name} "),
+        Style::default().fg(FOOTER_FG),
+    ));
+
+    let para = Paragraph::new(vec![title_line, screen_line])
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(INNER_BORDER_FG)),
+        )
+        .style(Style::default().bg(TITLE_BG));
+    frame.render_widget(para, area);
+}
+
+fn render_status_bar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let text = match app.play_state {
+        PlayState::Running => " daemon: connected  playing",
+        PlayState::Stopped => " daemon: connected  stopped",
+    };
+    let para = Paragraph::new(Span::styled(text, Style::default().fg(STATUS_FG)));
+    frame.render_widget(para, area);
+}
+
+fn render_footer_presets(frame: &mut ratatui::Frame, area: Rect) {
+    let para = Paragraph::new(vec![
+        Line::from(Span::styled(" ↑ ↓ / j k  navigate   Enter / Space  play", Style::default().fg(FOOTER_FG))),
+        Line::from(Span::styled(" q  quit", Style::default().fg(FOOTER_FG))),
+    ]);
+    frame.render_widget(para, area);
+}
+
+fn render_footer_visualizer(frame: &mut ratatui::Frame, area: Rect) {
+    let para = Paragraph::new(vec![
+        Line::from(Span::styled(" ← →  volume   s  stop   e  eq", Style::default().fg(FOOTER_FG))),
+        Line::from(Span::styled(" p / Tab  presets   q  quit", Style::default().fg(FOOTER_FG))),
+    ]);
+    frame.render_widget(para, area);
+}
+
+fn render_footer_eq(frame: &mut ratatui::Frame, area: Rect) {
+    let para = Paragraph::new(vec![
+        Line::from(Span::styled(" ← →  band   ↑ ↓  ±1 dB   r  reset", Style::default().fg(FOOTER_FG))),
+        Line::from(Span::styled(" Esc / Backspace  back   q  quit", Style::default().fg(FOOTER_FG))),
+    ]);
+    frame.render_widget(para, area);
+}
+
+fn render_presets(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .preset_list
         .iter()
@@ -301,71 +411,50 @@ fn render_presets(frame: &mut ratatui::Frame, app: &App) {
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Woosh — Select Preset ")
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(INNER_BORDER_FG)),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .highlight_style(
+            Style::default()
+                .bg(PRESET_HIGHLIGHT_BG)
+                .fg(PRESET_HIGHLIGHT_FG)
+                .add_modifier(Modifier::BOLD),
+        );
 
     let mut list_state = ListState::default();
     list_state.select(Some(app.selected_preset));
 
-    frame.render_stateful_widget(list, frame.area(), &mut list_state);
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn render_visualizer(frame: &mut ratatui::Frame, app: &App) {
-    let chunks = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(frame.area());
-
-    // Header.
-    let status_dot = if app.play_state == PlayState::Running {
-        "●"
-    } else {
-        "○"
-    };
-    let preset_name = app.active_preset.map_or("none", |p| match p {
-        NoisePreset::White => "white",
-        NoisePreset::Pink => "pink",
-        NoisePreset::Brown => "brown",
-    });
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let vol_pct = (app.volume * 100.0).clamp(0.0, 100.0) as u8;
-    let header_text = format!(" Woosh  {status_dot} {preset_name}  vol: {vol_pct}% ");
-    let header = Paragraph::new(header_text).block(Block::default().borders(Borders::ALL));
-    frame.render_widget(header, chunks[0]);
-
-    // Spectrum bar chart.
+fn render_visualizer(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let bar_data: Vec<(&str, u64)> = app.bar_heights.iter().map(|&h| ("", h)).collect();
     let chart = BarChart::default()
-        .block(Block::default().title(" Spectrum ").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(" Spectrum ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(INNER_BORDER_FG)),
+        )
         .data(bar_data.as_slice())
         .bar_width(3)
         .bar_gap(1)
+        .bar_style(Style::default().fg(SPECTRUM_BAR_FG))
         .max(100);
-    frame.render_widget(chart, chunks[1]);
-
-    // Footer hints.
-    let footer = Paragraph::new(" ← → vol   p presets   e eq   s stop   q quit ");
-    frame.render_widget(footer, chunks[2]);
+    frame.render_widget(chart, area);
 }
 
-fn render_eq(frame: &mut ratatui::Frame, app: &App) {
+fn render_eq(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     const LABELS: [&str; N_BANDS] = [
         "31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k",
     ];
 
     let chunks = Layout::vertical([
-        Constraint::Length(3),
         Constraint::Min(0),
         Constraint::Length(3),
-        Constraint::Length(1),
     ])
-    .split(frame.area());
+    .split(area);
 
-    // Header: selected band frequency and current gain.
     let band_freq = BAND_FREQS[app.selected_eq_band];
     let gain = app.eq_gains[app.selected_eq_band];
     let gain_str = if gain.abs() < 0.5 {
@@ -373,20 +462,17 @@ fn render_eq(frame: &mut ratatui::Frame, app: &App) {
     } else {
         format!("{gain:+.0} dB")
     };
-    let header_text = format!(" EQ — Band: {band_freq:.0} Hz   Gain: {gain_str} ");
-    let header = Paragraph::new(header_text).block(Block::default().borders(Borders::ALL));
-    frame.render_widget(header, chunks[0]);
 
-    // Bar chart: 10 bands, each bar maps ±12 dB → 0–24.
     let bars: Vec<Bar<'static>> = (0..N_BANDS)
         .map(|i| {
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             let value = (app.eq_gains[i] + 12.0).clamp(0.0, 24.0) as u64;
             let bar = Bar::default()
                 .value(value)
-                .label(Line::from(LABELS[i]));
+                .label(Line::from(LABELS[i]))
+                .style(Style::default().fg(SPECTRUM_BAR_FG));
             if i == app.selected_eq_band {
-                bar.style(Style::default().fg(Color::Yellow))
+                bar.style(Style::default().fg(EQ_SELECTED_FG))
             } else {
                 bar
             }
@@ -394,12 +480,17 @@ fn render_eq(frame: &mut ratatui::Frame, app: &App) {
         .collect();
 
     let chart = BarChart::default()
-        .block(Block::default().title(" Equalizer ").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(format!(" Equalizer — {band_freq:.0} Hz  {gain_str} "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(INNER_BORDER_FG)),
+        )
         .data(BarGroup::default().bars(&bars))
         .bar_width(5)
         .bar_gap(1)
         .max(24);
-    frame.render_widget(chart, chunks[1]);
+    frame.render_widget(chart, chunks[0]);
 
     // Readout: all gains with selected band bracketed.
     let readout: String = (0..N_BANDS)
@@ -424,12 +515,11 @@ fn render_eq(frame: &mut ratatui::Frame, app: &App) {
         })
         .collect::<Vec<_>>()
         .join("  ");
-    let readout_widget =
-        Paragraph::new(format!(" {readout} ")).block(Block::default().borders(Borders::ALL));
-    frame.render_widget(readout_widget, chunks[2]);
-
-    // Footer hints.
-    let footer =
-        Paragraph::new(" ← → band   ↑ ↓ ±1 dB   r reset   Esc back   q quit ");
-    frame.render_widget(footer, chunks[3]);
+    let readout_widget = Paragraph::new(format!(" {readout} "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(INNER_BORDER_FG)),
+        );
+    frame.render_widget(readout_widget, chunks[1]);
 }
