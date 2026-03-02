@@ -9,6 +9,7 @@ OVERVIEW: Tokio current_thread TUI client; renders ratatui UI, streams spectrum 
 | mod.rs    | Runtime, event loop (33ms tick), terminal setup/teardown, spectrum FFT pipeline |
 | app.rs    | `App` struct + `Screen` enum; all display state |
 | client.rs | `DaemonClient`; IPC send, subscribe_samples, encode/decode |
+| art.rs    | `LOGO_LINE` const (box-drawing "WOOSH" wordmark) + `DitherBackground` widget |
 
 ## SCREENS & KEYS
 
@@ -40,6 +41,14 @@ OVERVIEW: Tokio current_thread TUI client; renders ratatui UI, streams spectrum 
 
 - `BarChart::data()` takes `impl Into<BarGroup>`; pass `bar_data.as_slice()` where `bar_data: Vec<(&str, u64)>`.
 - Import `Bar`/`BarGroup` from `ratatui::widgets` directly, NOT `ratatui::widgets::bar`.
+
+## ART MODULE
+
+`art.rs` exposes two public items:
+- `LOGO_LINE: &str` — compact single-line "WOOSH" wordmark using box-drawing chars (`╦ ╦╔═╗╔═╗╔═╗╦ ╦`). Used in the title bar span.
+- `DitherBackground` — zero-size widget that fills a `Rect` with a deterministic diagonal dither pattern (`░▒` characters at `Rgb(45,35,80)` fg on `Rgb(8,6,18)` bg). Called by `render_dither_margins()` in `mod.rs` before the centered content box is drawn.
+
+`render_dither_margins()` in `mod.rs` computes four strips (top, bottom, left, right) around the centered `outer` rect and renders `DitherBackground` into each non-empty strip.
 
 ## ANTI-PATTERNS
 

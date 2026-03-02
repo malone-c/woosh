@@ -1,5 +1,6 @@
 pub mod app;
 pub mod client;
+mod art;
 
 use anyhow::Result;
 use app::{App, Screen, NUM_BARS};
@@ -294,8 +295,41 @@ fn centered_rect(area: Rect, max_w: u16, max_h: u16) -> Rect {
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
+fn render_dither_margins(frame: &mut ratatui::Frame, full: Rect, outer: Rect) {
+    // Top strip
+    if outer.y > full.y {
+        frame.render_widget(
+            art::DitherBackground,
+            Rect::new(full.x, full.y, full.width, outer.y - full.y),
+        );
+    }
+    // Bottom strip
+    if outer.bottom() < full.bottom() {
+        frame.render_widget(
+            art::DitherBackground,
+            Rect::new(full.x, outer.bottom(), full.width, full.bottom() - outer.bottom()),
+        );
+    }
+    // Left strip (rows alongside outer only)
+    if outer.x > full.x {
+        frame.render_widget(
+            art::DitherBackground,
+            Rect::new(full.x, outer.y, outer.x - full.x, outer.height),
+        );
+    }
+    // Right strip
+    if outer.right() < full.right() {
+        frame.render_widget(
+            art::DitherBackground,
+            Rect::new(outer.right(), outer.y, full.right() - outer.right(), outer.height),
+        );
+    }
+}
+
 fn render(frame: &mut ratatui::Frame, app: &App) {
-    let outer = centered_rect(frame.area(), 80, 24);
+    let full = frame.area();
+    let outer = centered_rect(full, 80, 24);
+    render_dither_margins(frame, full, outer);
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(BORDER_CYAN));
@@ -337,7 +371,7 @@ fn render_title_bar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     };
 
     let title_line = Line::from(vec![
-        Span::styled(" WOOSH  ", Style::default().fg(TITLE_FG).add_modifier(Modifier::BOLD)),
+        Span::styled(art::LOGO_LINE, Style::default().fg(TITLE_FG).add_modifier(Modifier::BOLD)),
         Span::styled(status_dot, Style::default().fg(dot_color)),
         Span::styled(format!(" {preset_name}  vol: {vol_pct}% "), Style::default().fg(TITLE_FG)),
     ]);

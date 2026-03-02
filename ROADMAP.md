@@ -282,10 +282,10 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 #### 3.5.7 — ASCII art and dithered backgrounds
 
-- [ ] Create `tui/art.rs` module with const string for ASCII logo ("WOOSH" in figlet font)
-- [ ] Add dithered wave/sound patterns in empty spaces (box-drawing chars: `░▒▓█`)
-- [ ] Display logo in title bar area
-- [ ] Render dithered background in margins outside centered content
+- [x] Create `tui/art.rs` module with const string for ASCII logo
+- [x] Add dithered wave/sound patterns in empty spaces (box-drawing chars: `░▒▓█`)
+- [x] Display logo in title bar area
+- [x] Render dithered background in margins outside centered content
 
 #### 3.5.8 — EQ as default screen
 
