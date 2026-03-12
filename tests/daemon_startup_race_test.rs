@@ -29,7 +29,7 @@ fn spawn_daemon_without_waiting(
     let sb = sample_buf;
     
     let handle = tokio::spawn(async move {
-        let _ = run_ipc_server(sp, st, tx, sb).await;
+        let _ = run_ipc_server(sp, st, tx, sb, 0).await;
     });
 
     (handle, state)

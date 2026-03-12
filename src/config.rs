@@ -35,6 +35,22 @@ impl Default for AudioConfig {
     }
 }
 
+/// Daemon lifecycle settings.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    /// Minutes of inactivity (no clients connected and both channels stopped)
+    /// before the daemon automatically shuts down. Set to `0` to disable.
+    pub idle_timeout_mins: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_mins: 15,
+        }
+    }
+}
+
 /// Top-level configuration struct.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -42,6 +58,8 @@ pub struct Config {
     pub defaults: DefaultsConfig,
     /// Audio engine settings.
     pub audio: AudioConfig,
+    /// Daemon lifecycle settings.
+    pub daemon: DaemonConfig,
 }
 
 /// Returns the path to the config file (`~/.config/woosh/config.toml`).

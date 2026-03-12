@@ -17,7 +17,7 @@ woosh/
 │   ├── config.rs       # ~/.config/woosh/config.toml load/create with defaults
 │   ├── daemon/         # Audio daemon: IPC server, audio thread, EQ, lifecycle
 │   │   └── AGENTS.md   # Daemon internals
-│   └── tui/            # ratatui TUI: event loop, spectrum, EQ screen
+│   └── tui/            # ratatui TUI: event loop, Presets + Equalizer screens
 │       └── AGENTS.md   # TUI internals
 ├── tests/
 │   ├── ipc_integration.rs          # 11 async tokio integration tests
@@ -86,6 +86,8 @@ Single Cargo package with `[lib]` + `[[bin]]`. Integration tests `use woosh::dae
 - `rustfmt.toml`: stable-only. Do NOT add nightly keys (`wrap_comments`, `imports_granularity`, `group_imports`, `format_code_in_doc_comments`).
 - Pinned dep versions in Cargo.toml. Do NOT bump without checking compat.
 - EQ gains are NOT persisted to config.toml (reset to flat on daemon restart).
+- `OutputStream` is opened lazily on first `Play`/`PlayPlace` and released when both channels are idle — allows BT headphone handoff.
+- `idle_timeout_mins` (default 15) in `[daemon]` config: daemon auto-shuts after N minutes with no clients and both channels stopped.
 
 ## COMMANDS
 

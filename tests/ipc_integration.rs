@@ -27,7 +27,7 @@ async fn spawn_test_server() -> (
     let st = Arc::clone(&state);
     let sb = Arc::clone(&sample_buf);
     tokio::spawn(async move {
-        run_ipc_server(sp, st, tx, sb).await.ok();
+        run_ipc_server(sp, st, tx, sb, 0).await.ok();
     });
 
     // Give the server time to bind.

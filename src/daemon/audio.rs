@@ -6,6 +6,7 @@ use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use rodio::Source;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -51,7 +52,7 @@ pub struct NoiseSource {
     sample_buf: Option<Arc<Mutex<Vec<f32>>>>,
     /// Counter for 1.5 s fade-in (0.0 → `66_150.0` samples at `44_100` Hz).
     /// Stored as `f32` (not `u32`) so arithmetic stays in one type and avoids
-    /// `cast_precision_loss` lints — the counter never exceeds 66_150 so there
+    /// `cast_precision_loss` lints — the counter never exceeds `66_150` so there
     /// is no precision difference in practice.
     fade_samples: f32,
     /// Shared flag; set to `true` by the audio thread to trigger fade-out.
@@ -181,11 +182,13 @@ impl Source for NoiseSource {
 /// Spawns the dedicated audio thread.
 ///
 /// `rodio::OutputStream` is `!Send`, so this must run on an OS thread,
-/// not a Tokio task. The thread owns the sink and processes `AudioCommand`s
+/// not a Tokio task. The thread owns the sinks and processes `AudioCommand`s
 /// until `Shutdown` or the channel is closed.
 ///
-/// # Panics
-/// Panics if a `rodio::Sink` cannot be created (audio device unavailable).
+/// The `OutputStream` is opened lazily on the first `Play`/`PlayPlace` command
+/// and released (dropping the device claim) once both channels are stopped and
+/// their fade-outs have drained. This allows Bluetooth headphones to hand off
+/// to other audio sources while woosh is idle.
 #[allow(clippy::too_many_lines)]
 pub fn spawn_audio_thread(
     state: Arc<Mutex<DaemonState>>,
@@ -195,64 +198,160 @@ pub fn spawn_audio_thread(
     place_eq_arc: Arc<Mutex<[f32; N_BANDS]>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let (_stream, handle) = match rodio::OutputStream::try_default() {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::error!("audio: failed to open output stream: {e}");
-                return;
-            }
-        };
+        // Used to distinguish a recv timeout (poll tick) from a channel close.
+        // Declared first so it precedes all `let` statements (items_after_statements lint).
+        enum Recv {
+            Got(AudioCommand),
+            Timeout,
+            Gone,
+        }
 
-        let initial_volume = state.lock().map(|s| s.volume).unwrap_or(0.8);
+        // Stream is opened lazily and dropped when both channels go idle.
+        // IMPORTANT: always drop sinks before dropping the stream — the stream
+        // owns the mixer thread that the sinks write into.
+        let mut opt_stream: Option<(rodio::OutputStream, rodio::OutputStreamHandle)> = None;
         let mut fade_out_flag = Arc::new(AtomicBool::new(false));
         let mut place_fade_out_flag: Option<Arc<AtomicBool>> = None;
-
-        let mut sink = rodio::Sink::try_new(&handle).expect("sink");
-        sink.set_volume(initial_volume);
-
+        let mut synth_sink: Option<rodio::Sink> = None;
         let mut place_sink: Option<rodio::Sink> = None;
 
         loop {
-            match rx.recv() {
-                Ok(AudioCommand::Play(preset)) => {
-                    drop(sink);
+            // While either channel is fading, use recv_timeout so we can poll
+            // for fade completion every 50 ms and release the device once done.
+            let synth_fading = fade_out_flag.load(Ordering::Relaxed)
+                && synth_sink.as_ref().is_some_and(|s| !s.empty());
+            let place_fading = place_fade_out_flag
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+                && place_sink.as_ref().is_some_and(|s| !s.empty());
+
+            let recv = if synth_fading || place_fading {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(cmd) => Recv::Got(cmd),
+                    Err(RecvTimeoutError::Timeout) => Recv::Timeout,
+                    Err(RecvTimeoutError::Disconnected) => Recv::Gone,
+                }
+            } else {
+                match rx.recv() {
+                    Ok(cmd) => Recv::Got(cmd),
+                    Err(_) => Recv::Gone,
+                }
+            };
+
+            let cmd = match recv {
+                // Channel closed: local variables drop in reverse declaration
+                // order, so synth_sink and place_sink drop before opt_stream.
+                Recv::Gone => break,
+                Recv::Timeout => {
+                    // Check whether fading sinks have finished and clean up.
+                    if synth_sink.as_ref().is_some_and(rodio::Sink::empty) {
+                        synth_sink = None;
+                    }
+                    if place_sink.as_ref().is_some_and(rodio::Sink::empty) {
+                        place_sink = None;
+                        place_fade_out_flag = None;
+                    }
+                    // Release the audio device when both channels are idle.
+                    if synth_sink.is_none() && place_sink.is_none() {
+                        let both_stopped = state.lock().map_or(true, |s| {
+                            s.play_state == PlayState::Stopped
+                                && s.place_state == PlayState::Stopped
+                        });
+                        if both_stopped {
+                            opt_stream = None; // releases CoreAudio / ALSA claim
+                        }
+                    }
+                    continue;
+                }
+                Recv::Got(cmd) => cmd,
+            };
+
+            match cmd {
+                AudioCommand::Play(preset) => {
+                    // Open the audio device lazily on first play.
+                    if opt_stream.is_none() {
+                        match rodio::OutputStream::try_default() {
+                            Ok(pair) => {
+                                opt_stream = Some(pair);
+                            }
+                            Err(e) => {
+                                tracing::error!("audio: failed to open output stream: {e}");
+                                if let Ok(mut s) = state.lock() {
+                                    s.play_state = PlayState::Stopped;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    let Some((_, handle)) = &opt_stream else {
+                        continue; // unreachable; satisfies the borrow checker
+                    };
+                    synth_sink = None; // drop old sink, abandoning any active fade
                     fade_out_flag = Arc::new(AtomicBool::new(false));
-                    sink = rodio::Sink::try_new(&handle).expect("sink");
-                    sink.append(EqProcessor::new(
-                        NoiseSource::new(
-                            preset,
-                            1.0,
-                            Some(Arc::clone(&sample_buf)),
-                            Arc::clone(&fade_out_flag),
-                        ),
-                        Arc::clone(&eq_arc),
-                    ));
-                    let volume = state.lock().map(|s| s.volume).unwrap_or(0.8);
-                    sink.set_volume(volume);
+                    match rodio::Sink::try_new(handle) {
+                        Ok(new_sink) => {
+                            new_sink.append(EqProcessor::new(
+                                NoiseSource::new(
+                                    preset,
+                                    1.0,
+                                    Some(Arc::clone(&sample_buf)),
+                                    Arc::clone(&fade_out_flag),
+                                ),
+                                Arc::clone(&eq_arc),
+                            ));
+                            let volume = state.lock().map(|s| s.volume).unwrap_or(0.8);
+                            new_sink.set_volume(volume);
+                            synth_sink = Some(new_sink);
+                        }
+                        Err(e) => {
+                            tracing::error!("audio: failed to create synth sink: {e}");
+                        }
+                    }
                     if let Ok(mut s) = state.lock() {
                         s.play_state = PlayState::Running;
                         s.preset = Some(preset);
                     }
                 }
-                Ok(AudioCommand::Stop) => {
+                AudioCommand::Stop => {
                     fade_out_flag.store(true, Ordering::Release);
                     if let Ok(mut s) = state.lock() {
                         s.play_state = PlayState::Stopped;
                     }
                 }
-                Ok(AudioCommand::SetVolume(v)) => {
+                AudioCommand::SetVolume(v) => {
                     let clamped = v.clamp(0.0, 1.0);
-                    sink.set_volume(clamped);
+                    if let Some(s) = &synth_sink {
+                        s.set_volume(clamped);
+                    }
                     if let Ok(mut s) = state.lock() {
                         s.volume = clamped;
                     }
                 }
-                Ok(AudioCommand::SetEq(gains)) => {
+                AudioCommand::SetEq(gains) => {
                     if let Ok(mut guard) = eq_arc.lock() {
                         *guard = gains;
                     }
                 }
-                Ok(AudioCommand::PlayPlace(location)) => {
+                AudioCommand::PlayPlace(location) => {
+                    // Open the audio device lazily on first play.
+                    if opt_stream.is_none() {
+                        match rodio::OutputStream::try_default() {
+                            Ok(pair) => {
+                                opt_stream = Some(pair);
+                            }
+                            Err(e) => {
+                                tracing::error!("audio: failed to open output stream: {e}");
+                                if let Ok(mut s) = state.lock() {
+                                    s.place_state = PlayState::Stopped;
+                                    s.place_location = None;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    let Some((_, handle)) = &opt_stream else {
+                        continue;
+                    };
                     place_sink = None; // kills old mpv via MpvSource::drop
                     let flag = Arc::new(AtomicBool::new(false));
                     match MpvSource::spawn(&location, Arc::clone(&flag)) {
@@ -263,7 +362,7 @@ pub fn spawn_audio_thread(
                                 s.place_location = None;
                             }
                         }
-                        Ok(source) => match rodio::Sink::try_new(&handle) {
+                        Ok(source) => match rodio::Sink::try_new(handle) {
                             Err(e) => {
                                 tracing::error!("audio: place sink failed: {e}");
                                 if let Ok(mut s) = state.lock() {
@@ -288,7 +387,7 @@ pub fn spawn_audio_thread(
                         },
                     }
                 }
-                Ok(AudioCommand::StopPlace) => {
+                AudioCommand::StopPlace => {
                     if let Some(ref flag) = place_fade_out_flag {
                         flag.store(true, Ordering::Release);
                     }
@@ -297,7 +396,7 @@ pub fn spawn_audio_thread(
                         s.place_location = None;
                     }
                 }
-                Ok(AudioCommand::SetPlaceVolume(v)) => {
+                AudioCommand::SetPlaceVolume(v) => {
                     let clamped = v.clamp(0.0, 1.0);
                     if let Ok(mut s) = state.lock() {
                         s.place_volume = clamped;
@@ -306,7 +405,7 @@ pub fn spawn_audio_thread(
                         sink.set_volume(clamped);
                     }
                 }
-                Ok(AudioCommand::SetPlaceEq(gains)) => {
+                AudioCommand::SetPlaceEq(gains) => {
                     if let Ok(mut guard) = place_eq_arc.lock() {
                         *guard = gains;
                     }
@@ -314,8 +413,11 @@ pub fn spawn_audio_thread(
                         s.place_eq_gains = gains;
                     }
                 }
-                Ok(AudioCommand::Shutdown) | Err(_) => {
-                    drop(place_sink); // kill mpv before exit
+                AudioCommand::Shutdown => {
+                    // Locals are declared opt_stream → synth_sink → place_sink,
+                    // so Rust drops them in reverse: place_sink → synth_sink →
+                    // opt_stream. Sinks are torn down before the stream's mixer
+                    // thread — the required ordering.
                     break;
                 }
             }

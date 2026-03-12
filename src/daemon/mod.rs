@@ -67,7 +67,13 @@ pub fn start(no_daemonize: bool) -> Result<()> {
         .enable_all()
         .build()?;
     
-    runtime.block_on(ipc::run_ipc_server(socket_path, state, tx, sample_buf))?;
+    runtime.block_on(ipc::run_ipc_server(
+        socket_path,
+        state,
+        tx,
+        sample_buf,
+        config.daemon.idle_timeout_mins,
+    ))?;
 
     Ok(())
 }

@@ -5,8 +5,9 @@ use crate::daemon::state::{DaemonState, NoisePreset, PlayState};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::UnboundedSender;
@@ -14,6 +15,15 @@ use tokio::time::MissedTickBehavior;
 
 /// Registry of live sample-stream subscriber channels.
 type SubscriberRegistry = Arc<Mutex<Vec<UnboundedSender<String>>>>;
+
+/// RAII guard that decrements a client counter when dropped.
+struct ClientCountGuard(Arc<AtomicUsize>);
+
+impl Drop for ClientCountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Runs the Unix-socket IPC server, accepting connections until the daemon exits.
 ///
@@ -24,6 +34,7 @@ pub async fn run_ipc_server(
     state: Arc<Mutex<DaemonState>>,
     audio_tx: std::sync::mpsc::Sender<AudioCommand>,
     sample_buf: Arc<Mutex<Vec<f32>>>,
+    idle_timeout_mins: u64,
 ) -> Result<()> {
     // Remove stale socket from a previous run.
     let _ = std::fs::remove_file(&socket_path);
@@ -36,6 +47,38 @@ pub async fn run_ipc_server(
         Arc::clone(&sample_buf),
         Arc::clone(&subscribers),
     ));
+
+    let client_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
+    // Watchdog: auto-shutdown when idle (no clients, both channels stopped).
+    if idle_timeout_mins > 0 {
+        let state_w = Arc::clone(&state);
+        let tx_w = audio_tx.clone();
+        let count_w = Arc::clone(&client_count);
+        tokio::spawn(async move {
+            let mut idle_since: Option<Instant> = None;
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let clients = count_w.load(Ordering::Relaxed);
+                let both_stopped = state_w.lock().map_or(true, |s| {
+                    s.play_state == PlayState::Stopped && s.place_state == PlayState::Stopped
+                });
+                if clients == 0 && both_stopped {
+                    let since = idle_since.get_or_insert_with(Instant::now);
+                    let elapsed_mins = since.elapsed().as_secs() / 60;
+                    if elapsed_mins >= idle_timeout_mins {
+                        tracing::info!(
+                            "auto-shutdown: idle for {elapsed_mins} min with no clients"
+                        );
+                        let _ = tx_w.send(AudioCommand::Shutdown);
+                        break;
+                    }
+                } else {
+                    idle_since = None;
+                }
+            }
+        });
+    }
 
     // Yield to the tokio runtime to ensure we're in the event loop
     // and ready to accept connections before signaling readiness.
@@ -53,8 +96,9 @@ pub async fn run_ipc_server(
         let tx = audio_tx.clone();
         let socket_path = socket_path.clone();
         let subs = Arc::clone(&subscribers);
+        let count = Arc::clone(&client_count);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, state, tx, socket_path, subs).await {
+            if let Err(e) = handle_connection(stream, state, tx, socket_path, subs, count).await {
                 tracing::warn!("IPC connection error: {e}");
             }
         });
@@ -106,7 +150,11 @@ async fn handle_connection(
     audio_tx: std::sync::mpsc::Sender<AudioCommand>,
     socket_path: PathBuf,
     subscribers: SubscriberRegistry,
+    client_count: Arc<AtomicUsize>,
 ) -> Result<()> {
+    client_count.fetch_add(1, Ordering::Relaxed);
+    let _guard = ClientCountGuard(client_count);
+
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 

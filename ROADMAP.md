@@ -287,12 +287,29 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 - [x] Display logo in title bar area
 - [x] Render dithered background in margins outside centered content
 
-#### 3.5.8 — EQ as default screen
+#### 3.5.11 — Release audio device when both channels are stopped
 
-- [ ] Change `Screen` enum default from `Visualizer` to `Equalizer`
-- [ ] Update Preset screen `→` key to navigate to `Equalizer` instead of `Visualizer`
-- [ ] Move spectrum analyzer to `s` key toggle (optional feature, not removed)
-- [ ] Update footer hints to reflect new navigation flow
+- [x] Change audio thread to hold `Option<(OutputStream, OutputStreamHandle)>` instead of an always-open stream
+- [x] Open `OutputStream` lazily on first `Play`/`PlayPlace` command
+- [x] After `Stop`/`StopPlace`: use `recv_timeout(50 ms)` polling while either channel is fading
+- [x] On timeout: check `sink.empty()`; drop sink when true; drop stream when both sinks gone and both `PlayState::Stopped`
+- [x] Correct drop ordering enforced by Rust's reverse-declaration semantics (sinks declared after stream → dropped first)
+
+#### 3.5.12 — Auto-shutdown daemon after configurable idle period
+
+- [x] Add `DaemonConfig { idle_timeout_mins: u64 }` (default 15) to `src/config.rs` and `[daemon]` section in `config.toml`
+- [x] Add `Arc<AtomicUsize>` client counter to `run_ipc_server`; RAII `ClientCountGuard` decrements on every connection exit path
+- [x] Watchdog tokio task: checks every 60 s; if `client_count == 0` and both channels stopped for ≥ `idle_timeout_mins`, sends `AudioCommand::Shutdown`
+- [x] Thread `idle_timeout_mins` through `mod.rs` → `run_ipc_server`; integration tests pass `0` (disabled) to avoid flakiness
+- [x] All 33 tests pass; zero clippy warnings
+
+#### 3.5.8 — EQ as default screen (Visualizer removed)
+
+- [x] Remove `Screen::Visualizer` variant; two screens remain: `Presets` and `Equalizer`
+- [x] Enter/Space on Presets plays preset and navigates directly to `Equalizer`
+- [x] Spectrum pipeline removed (subscribe_samples, FFT, bar_heights, sample_window fields)
+- [x] EQ footer updated: `s` stops playback; Esc/p/Tab returns to Presets
+- [x] Presets footer hint updated to `Enter / Space  play + eq`
 
 #### 3.5.9 — Place Selector screen and dual volume controls
 
@@ -310,7 +327,7 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 ### Exit Criteria
 
-User can play synthetic noise + YouTube place sound simultaneously with independent volumes. TUI opens in a stopped state; noise only begins when the user explicitly selects a preset. All sounds fade in and fade out smoothly. TUI displays centered, colorful layout with ASCII art. CLI shortcuts `woosh pink` and `woosh tokyo` work. EQ is default screen with spectrum as toggle.
+User can play synthetic noise + YouTube place sound simultaneously with independent volumes. TUI opens in a stopped state; noise only begins when the user explicitly selects a preset. All sounds fade in and fade out smoothly. TUI displays centered, colorful layout with ASCII art. CLI shortcuts `woosh pink` and `woosh tokyo` work. EQ is the primary screen (spectrum visualizer removed).
 
 ---
 
@@ -385,7 +402,7 @@ A polished, documented release candidate that a new user can install and use wit
 |-------|-------------|-----------------|--------|
 | 0 | Project scaffold | Compilable repo, CI green | ✅ Complete |
 | 1 | Audio daemon MVP | White noise plays, IPC works | ✅ Complete |
-| 2 | TUI + Visualizer | Interactive UI, spectrum bars, pink/brown noise | ✅ Complete |
+| 2 | TUI + Visualizer | Interactive UI, pink/brown noise (spectrum visualizer later removed) | ✅ Complete |
 | 3 | EQ controls | Parametric EQ from TUI | ✅ Complete |
 | 3.5 | Place sounds & UI redesign | YouTube integration, dual audio, centered layout, ASCII art | 🚧 Planned |
 | 4 | Presets & polish | Named presets, help overlay, mouse support | 📋 Future |

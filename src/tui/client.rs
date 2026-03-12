@@ -89,7 +89,7 @@ impl DaemonClient {
 ///
 /// # Errors
 /// Returns an error only if the task cannot be spawned.
-pub async fn subscribe_samples(
+pub fn subscribe_samples(
     socket_path: PathBuf,
     tx: tokio::sync::mpsc::Sender<Vec<f32>>,
 ) -> Result<JoinHandle<()>> {

@@ -26,7 +26,7 @@ pub struct MpvSource {
     reader_done: Arc<AtomicBool>,
     /// Counter for 1.5 s fade-in (0.0 → `66_150.0` samples at `44_100` Hz).
     /// Stored as `f32` (not `u32`) so arithmetic stays in one type and avoids
-    /// `cast_precision_loss` lints — the counter never exceeds 66_150 so there
+    /// `cast_precision_loss` lints — the counter never exceeds `66_150` so there
     /// is no precision difference in practice.
     fade_samples: f32,
     /// Shared flag; set to `true` by the audio thread to trigger fade-out.

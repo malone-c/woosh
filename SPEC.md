@@ -226,7 +226,9 @@ Reverb adds CPU overhead (mpv subprocess filter chain), so it defaults to disabl
 2. If PID file absent or stale (process not alive), spawn `woosh daemon` as a detached child using `daemonize`.
 3. Wait up to 500 ms for the socket file to appear, then connect.
 4. Daemon starts in a **stopped state** — no audio plays until the first `PLAY` command is received.
-5. On `QUIT` command or `SIGTERM`, flush audio, remove socket and PID file, exit.
+5. The `rodio::OutputStream` (audio device claim) is opened **lazily** on the first `PLAY` or `PLAY_PLACE` command and released automatically once both channels have stopped and their fade-outs have drained. This allows Bluetooth headphones to hand off to other apps while woosh is idle.
+6. When both channels have been stopped and no clients are connected for `idle_timeout_mins` minutes (configurable, default 15), the daemon auto-shuts down. Set `idle_timeout_mins = 0` to disable auto-shutdown.
+7. On `QUIT` command or `SIGTERM`, flush audio, remove socket and PID file, exit.
 
 ### PID & Socket Paths
 
@@ -634,7 +636,8 @@ show_ascii_art = true
 color_scheme = "default"      # default = blues/purples/pinks
 
 [daemon]
-log_level = "info"   # error | warn | info | debug | trace
+log_level = "info"            # error | warn | info | debug | trace
+idle_timeout_mins = 15        # auto-shutdown after N minutes idle (0 = never)
 ```
 
 On first run, if the file is absent, woosh writes the defaults above.

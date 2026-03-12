@@ -13,8 +13,8 @@ Seven modules implement the daemon: orchestration, lifecycle, state, IPC server,
 | mod.rs        | 79    | Orchestrator: creates shared Arcs, spawns audio thread, runs tokio runtime  |
 | lifecycle.rs  | 140   | PID/socket/ready-file paths, daemonize(), daemon_is_alive(), init_logging() |
 | state.rs      | 83    | NoisePreset (White/Pink/Brown), PlayState, DaemonState struct; preset is Option<NoisePreset>, default Stopped/None |
-| ipc.rs        | 328   | UnixListener, dispatch() command router, broadcast_task() every 33ms        |
-| audio.rs      | 415   | spawn_audio_thread(), NoiseSource generators, AudioCommand enum             |
+| ipc.rs        | ~390  | UnixListener, dispatch() command router, broadcast_task() every 33ms, client counter + watchdog |
+| audio.rs      | ~430  | spawn_audio_thread(), NoiseSource generators, AudioCommand enum, lazy stream |
 | eq.rs         | 201   | BiquadCoeffs, BiquadState, peaking_coeffs(), apply_biquad(), EqProcessor   |
 | mpv.rs        | 174   | MpvSource: mpv subprocess → PCM → VecDeque → rodio Source                  |
 
@@ -35,9 +35,9 @@ Four shared objects wired at startup in mod.rs and passed into IPC + audio:
 - Every 512 samples, NoiseSource calls `try_lock` on sample_buf; skips on contention — never blocks.
 - `AudioCommand` variants: `Play`, `Stop`, `SetVolume`, `SetEq`, `PlayPlace`, `StopPlace`, `SetPlaceVolume`, `Shutdown`.
 - EqProcessor wraps NoiseSource in the rodio sink; also polls eq_gains via `try_lock` every 512 samples.
-- **Startup:** The sink is created empty — no `NoiseSource` is appended at startup. The daemon starts in `PlayState::Stopped` with `preset: None`. Audio only begins on the first `Play` command.
+- **Startup:** No `OutputStream` or sinks exist at startup. The daemon starts in `PlayState::Stopped` with `preset: None`. The `OutputStream` (audio device claim) is opened lazily on the first `Play`/`PlayPlace` command.
 - **Fade-in:** Both `NoiseSource` and `MpvSource` ramp from 0 → 1.0 over 66,150 samples (1.5 s at 44,100 Hz) via `fade_samples` counter. Resets automatically when sources are recreated on `Play`/`PlayPlace`.
-- **Fade-out:** Each source holds a shared `Arc<AtomicBool>` (`fade_out`) and a `fade_out_samples: u32` counter. `Stop` sets the noise flag; `StopPlace` sets the place flag. The source then ramps 1.0 → 0.0 over 66,150 samples and returns `None` — rodio drains the sink naturally. `Play`/`PlayPlace` create a fresh `Arc<AtomicBool>`, so the old fade-out is abandoned when the sink is dropped.
+- **Fade-out:** Each source holds a shared `Arc<AtomicBool>` (`fade_out`) and a `fade_out_samples: f32` counter. `Stop` sets the noise flag; `StopPlace` sets the place flag. The source then ramps 1.0 → 0.0 over 66,150 samples and returns `None` — rodio drains the sink naturally. While fading, the audio thread uses `recv_timeout(50 ms)` to poll `sink.empty()`; when true, the sink is dropped. When both sinks are None and both states are Stopped, `opt_stream.take()` releases the CoreAudio/ALSA device claim. `Play`/`PlayPlace` create a fresh `Arc<AtomicBool>`, abandoning any active fade.
 
 ## EQ SUBSYSTEM (eq.rs)
 
