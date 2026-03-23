@@ -11,8 +11,8 @@ pub const LOGO_LINE: &str = " ＷＯＯＳＨ ";
 
 pub struct DitherBackground;
 
-const DITHER_FG: Color = Color::Rgb(45, 35, 80);
-const DITHER_BG: Color = Color::Rgb(8, 6, 18);
+const DITHER_FG: Color = Color::Rgb(64, 58, 54);
+const DITHER_BG: Color = Color::Rgb(41, 37, 34);
 
 // 5 levels of density: space, light, light, medium, medium
 const DITHER_SYMBOLS: [&str; 5] = [" ", "░", "░", "▒", "▒"];

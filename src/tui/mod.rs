@@ -21,17 +21,17 @@ use tokio::time::MissedTickBehavior;
 use crate::daemon::eq::{BAND_FREQS, GAIN_MAX, GAIN_MIN, N_BANDS};
 use crate::daemon::state::{NoisePreset, PlayState};
 
-const BORDER_CYAN:         Color = Color::Rgb(0, 210, 210);
-const TITLE_FG:            Color = Color::Rgb(200, 180, 255);
-const TITLE_BG:            Color = Color::Rgb(30, 20, 60);
-const FOOTER_FG:           Color = Color::Rgb(160, 130, 220);
-const STATUS_FG:           Color = Color::Rgb(120, 140, 170);
-const PRESET_HIGHLIGHT_BG: Color = Color::Rgb(60, 40, 120);
-const PRESET_HIGHLIGHT_FG: Color = Color::Rgb(240, 230, 255);
-const EQ_SELECTED_FG:      Color = Color::Rgb(210, 100, 255);
-const PLAYING_DOT_FG:      Color = Color::Rgb(0, 255, 180);
-const STOPPED_DOT_FG:      Color = Color::Rgb(90, 90, 110);
-const INNER_BORDER_FG:     Color = Color::Rgb(70, 60, 110);
+const BORDER_CYAN:         Color = Color::Rgb(137, 179, 182);
+const TITLE_FG:            Color = Color::Rgb(236, 225, 215);
+const TITLE_BG:            Color = Color::Rgb(52, 48, 44);
+const FOOTER_FG:           Color = Color::Rgb(193, 167, 142);
+const STATUS_FG:           Color = Color::Rgb(134, 116, 98);
+const PRESET_HIGHLIGHT_BG: Color = Color::Rgb(64, 58, 54);
+const PRESET_HIGHLIGHT_FG: Color = Color::Rgb(236, 225, 215);
+const EQ_SELECTED_FG:      Color = Color::Rgb(235, 192, 109);
+const PLAYING_DOT_FG:      Color = Color::Rgb(133, 182, 149);
+const STOPPED_DOT_FG:      Color = Color::Rgb(134, 116, 98);
+const INNER_BORDER_FG:     Color = Color::Rgb(64, 58, 54);
 
 /// Entry point: run the TUI in a single-threaded Tokio runtime.
 ///
@@ -146,22 +146,22 @@ async fn handle_key(app: &mut App, client: &DaemonClient, key: KeyEvent) -> Resu
             _ => {}
         },
         Screen::Equalizer => match key.code {
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 if app.selected_eq_band > 0 {
                     app.selected_eq_band -= 1;
                 }
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Char('l') => {
                 if app.selected_eq_band + 1 < N_BANDS {
                     app.selected_eq_band += 1;
                 }
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 let band = app.selected_eq_band;
                 app.eq_gains[band] = (app.eq_gains[band] + 1.0).clamp(GAIN_MIN, GAIN_MAX);
                 client.set_eq_band(band, app.eq_gains[band]).await?;
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 let band = app.selected_eq_band;
                 app.eq_gains[band] = (app.eq_gains[band] - 1.0).clamp(GAIN_MIN, GAIN_MAX);
                 client.set_eq_band(band, app.eq_gains[band]).await?;
@@ -173,11 +173,29 @@ async fn handle_key(app: &mut App, client: &DaemonClient, key: KeyEvent) -> Resu
                 }
             }
             KeyCode::Char('s') => {
-                client.send_command("STOP").await?;
-                app.play_state = PlayState::Stopped;
+                if app.play_state == PlayState::Running {
+                    client.send_command("STOP").await?;
+                    app.play_state = PlayState::Stopped;
+                } else if let Some(preset) = app.active_preset {
+                    let cmd = format!("PLAY {preset}");
+                    client.send_command(&cmd).await?;
+                    app.play_state = PlayState::Running;
+                }
             }
             KeyCode::Tab | KeyCode::Char('p') | KeyCode::Esc | KeyCode::Backspace => {
                 app.screen = Screen::Presets;
+            }
+            KeyCode::Char('[') => {
+                app.volume = (app.volume - 0.05).clamp(0.0, 1.0);
+                client
+                    .send_fire_and_forget(&format!("SET_VOLUME {:.2}", app.volume))
+                    .await?;
+            }
+            KeyCode::Char(']') => {
+                app.volume = (app.volume + 0.05).clamp(0.0, 1.0);
+                client
+                    .send_fire_and_forget(&format!("SET_VOLUME {:.2}", app.volume))
+                    .await?;
             }
             KeyCode::Char('q' | 'Q') => {
                 app.should_quit = true;
@@ -312,7 +330,7 @@ fn render_footer_presets(frame: &mut ratatui::Frame, area: Rect) {
 
 fn render_footer_eq(frame: &mut ratatui::Frame, area: Rect) {
     let para = Paragraph::new(vec![
-        Line::from(Span::styled(" ← →  band   ↑ ↓  ±1 dB   r  reset   s  stop", Style::default().fg(FOOTER_FG))),
+        Line::from(Span::styled(" ← →  band   ↑ ↓  ±1 dB   r  reset   s  play/stop   [ ]  vol", Style::default().fg(FOOTER_FG))),
         Line::from(Span::styled(" Esc / p / Tab  presets   q  quit", Style::default().fg(FOOTER_FG))),
     ]);
     frame.render_widget(para, area);
@@ -361,11 +379,7 @@ fn render_eq(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         "31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k",
     ];
 
-    let chunks = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length(3),
-    ])
-    .split(area);
+    let chunks = Layout::vertical([Constraint::Min(0)]).split(area);
 
     let band_freq = BAND_FREQS[app.selected_eq_band];
     let gain = app.eq_gains[app.selected_eq_band];
@@ -379,15 +393,21 @@ fn render_eq(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         .map(|i| {
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             let value = (app.eq_gains[i] + 12.0).clamp(0.0, 24.0) as u64;
-            let bar = Bar::default()
-                .value(value)
-                .label(Line::from(LABELS[i]))
-                .style(Style::default().fg(Color::Rgb(80, 160, 255)));
-            if i == app.selected_eq_band {
-                bar.style(Style::default().fg(EQ_SELECTED_FG))
+            let text_val = if app.eq_gains[i].abs() < 0.5 {
+                "0".to_owned()
             } else {
-                bar
-            }
+                format!("{:+.0}", app.eq_gains[i])
+            };
+            let fg = if i == app.selected_eq_band {
+                EQ_SELECTED_FG
+            } else {
+                Color::Rgb(163, 169, 206)
+            };
+            Bar::default()
+                .value(value)
+                .text_value(text_val)
+                .label(Line::from(LABELS[i]))
+                .style(Style::default().fg(fg))
         })
         .collect();
 
@@ -403,35 +423,4 @@ fn render_eq(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         .bar_gap(1)
         .max(24);
     frame.render_widget(chart, chunks[0]);
-
-    // Readout: all gains with selected band bracketed.
-    let readout: String = (0..N_BANDS)
-        .map(|i| {
-            let g = app.eq_gains[i];
-            let s = if g.abs() < 0.5 {
-                "0".to_owned()
-            } else if g > 0.0 {
-                #[allow(clippy::cast_possible_truncation)]
-                let v = g.round() as i32;
-                format!("+{v}")
-            } else {
-                #[allow(clippy::cast_possible_truncation)]
-                let v = g.round() as i32;
-                format!("{v}")
-            };
-            if i == app.selected_eq_band {
-                format!("[{s}]")
-            } else {
-                s
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("  ");
-    let readout_widget = Paragraph::new(format!(" {readout} "))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(INNER_BORDER_FG)),
-        );
-    frame.render_widget(readout_widget, chunks[1]);
 }

@@ -15,7 +15,7 @@ OVERVIEW: Tokio current_thread TUI client; renders ratatui UI, handles keyboard 
 
 **Presets** (`Screen::Presets`): ↑/↓/j/k navigate; Enter/Space plays preset + switches to Equalizer; q quit.
 
-**Equalizer** (`Screen::Equalizer`): ←/→ select band (0–9); ↑/↓ gain ±1 dB (clamped ±12 dB); r reset all bands; s stop; Esc/p/Tab → Presets; q quit.
+**Equalizer** (`Screen::Equalizer`): ←/→/h/l select band (0–9); ↑/↓/k/j gain ±1 dB (clamped ±12 dB); r reset all bands; s toggle play/stop (resumes last preset if stopped); [ decrease volume 5%; ] increase volume 5%; Esc/p/Tab → Presets; q quit.
 
 ## IPC CLIENT NOTES
 
@@ -29,6 +29,9 @@ OVERVIEW: Tokio current_thread TUI client; renders ratatui UI, handles keyboard 
 
 - `BarChart::data()` takes `impl Into<BarGroup>`; pass `bar_data.as_slice()` where `bar_data: Vec<(&str, u64)>`.
 - Import `Bar`/`BarGroup` from `ratatui::widgets` directly, NOT `ratatui::widgets::bar`.
+- EQ bars use `.text_value(String)` to show actual dB values (e.g. "+3", "-2", "0") instead of raw offset integers.
+- EQ bar colours: boost >0.5 dB → `EQ_BOOST_FG` (orange); cut <-0.5 dB → blue `Rgb(80,160,255)`; flat → `EQ_FLAT_FG` (gray); selected → `EQ_SELECTED_FG` (magenta, overrides all).
+- EQ screen uses a single-slot layout (`Constraint::Min(0)`) — no readout panel; selected band info shown in block title.
 
 ## ART MODULE
 

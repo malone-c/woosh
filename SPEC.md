@@ -436,6 +436,7 @@ The TUI features a **centered, colorful layout with ASCII art**:
 | `s` | Toggle Spectrum Analyzer (from Equalizer screen) |
 | `l` | Go to Place Selector |
 | `←` / `→` | Synth volume down / up (Preset screen); select band (EQ screen) |
+| `[` / `]` | Synth volume down / up (EQ screen, ±5 % per press) |
 | `Shift+←` / `Shift+→` | Place volume down / up (Place Selector) |
 | `↑` / `↓` | Navigate list (Preset screen); adjust EQ gain ±1 dB (EQ screen) |
 | `Enter` | Confirm selection / start playback |
@@ -524,7 +525,7 @@ SYNC_EQ <bool>                        # enable/disable EQ sync mode
 
 The EQ screen (Screen 2) is now the **default landing screen** (changed from spectrum analyzer). It shows a `BarChart` of 10 bands (bar height maps ±12 dB → 0–24 range) with the selected band highlighted in yellow. A readout line beneath shows all gains numerically.
 
-Key bindings: `←`/`→` navigate bands, `↑`/`↓` adjust ±1 dB, `r` resets all to flat, `s` toggles spectrum analyzer, `Esc` or `p` returns to the Preset Selector.
+Key bindings: `←`/`→` navigate bands, `↑`/`↓` adjust ±1 dB, `r` resets all to flat, `[`/`]` adjust synth volume ±5 %, `s` toggles spectrum analyzer, `Esc` or `p` returns to the Preset Selector.
 
 When **advanced_eq_mode = false** (default): Adjusting EQ updates both synth and place channels simultaneously.
 

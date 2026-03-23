@@ -311,6 +311,13 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 - [x] EQ footer updated: `s` stops playback; Esc/p/Tab returns to Presets
 - [x] Presets footer hint updated to `Enter / Space  play + eq`
 
+#### 3.5.13 — Volume control from EQ screen
+
+- [x] `[` decreases synth volume by 5 % (clamped to 0.0); `]` increases by 5 % (clamped to 1.0)
+- [x] Optimistic update: `app.volume` updated immediately; title bar reflects it on next tick
+- [x] Uses `send_fire_and_forget` (same pattern as `SET_EQ`); sends `SET_VOLUME {:.2}` to daemon
+- [x] Footer hint updated: `[ ]  vol` appended to EQ screen hint line
+
 #### 3.5.9 — Place Selector screen and dual volume controls
 
 - [ ] Add new `PlaceSelector` screen accessible via `l` key
