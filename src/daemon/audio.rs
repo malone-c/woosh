@@ -118,7 +118,7 @@ impl Iterator for NoiseSource {
         let white = self.dist.sample(&mut self.rng);
 
         let raw = match &mut self.algorithm {
-            NoiseAlgorithm::White => white,
+            NoiseAlgorithm::White => white * 0.1725,
             NoiseAlgorithm::Pink { b } => {
                 b[0] = 0.99886 * b[0] + white * 0.055_517_9;
                 b[1] = 0.99332 * b[1] + white * 0.075_075_9;
@@ -128,11 +128,11 @@ impl Iterator for NoiseSource {
                 b[5] = -0.761_6 * b[5] - white * 0.016_898_0;
                 let pink = b[0] + b[1] + b[2] + b[3] + b[4] + b[5] + b[6] + white * 0.536_2;
                 b[6] = white * 0.115_926;
-                pink * 0.11
+                pink * 0.057
             }
             NoiseAlgorithm::Brown { last } => {
                 *last = (*last + 0.02 * white) / 1.02;
-                (*last * 3.5).clamp(-1.0, 1.0)
+                (*last * 1.76).clamp(-1.0, 1.0)
             }
         };
 
@@ -441,9 +441,9 @@ mod tests {
         let mean: f32 = samples.iter().sum::<f32>() / 10_000.0;
         let variance: f32 = samples.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / 10_000.0;
         let std_dev = variance.sqrt();
-        // Uniform [-1,1]: mean=0, std_dev=1/√3≈0.577
-        assert!(mean.abs() < 0.05, "mean={mean}");
-        assert!((std_dev - 0.577).abs() < 0.05, "std_dev={std_dev}");
+        // Uniform [-1,1] scaled by 0.1725: mean=0, std_dev≈0.1725/√3≈0.0996
+        assert!(mean.abs() < 0.01, "mean={mean}");
+        assert!((std_dev - 0.0996).abs() < 0.01, "std_dev={std_dev}");
     }
 
     #[test]
@@ -504,5 +504,61 @@ mod tests {
             mid_rms < start_rms,
             "fade-out envelope not decreasing: start_rms={start_rms}, mid_rms={mid_rms}"
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn measure_noise_levels() {
+        const FADE_IN_SAMPLES: usize = 66_150;
+        const MEASURE_SAMPLES: usize = 44_100;
+
+        struct Metrics {
+            rms: f32,
+            peak: f32,
+            crest: f32,
+        }
+
+        fn measure(preset: NoisePreset) -> Metrics {
+            let mut src = NoiseSource::new(
+                preset,
+                1.0,
+                None,
+                Arc::new(AtomicBool::new(false)),
+            );
+            for _ in 0..FADE_IN_SAMPLES {
+                let _ = src.next();
+            }
+            let samples: Vec<f32> = (0..MEASURE_SAMPLES)
+                .map(|_| src.next().unwrap())
+                .collect();
+            #[allow(clippy::cast_precision_loss)]
+            let mean_sq: f32 =
+                samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32;
+            let rms = mean_sq.sqrt();
+            let peak = samples.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+            let crest = if rms > 0.0 { peak / rms } else { 0.0 };
+            Metrics { rms, peak, crest }
+        }
+
+        let presets = [
+            ("White", NoisePreset::White),
+            ("Pink", NoisePreset::Pink),
+            ("Brown", NoisePreset::Brown),
+        ];
+
+        println!();
+        println!(
+            "{:<8}  {:>10}  {:>10}  {:>12}",
+            "Preset", "RMS", "Peak", "Crest Factor"
+        );
+        println!("{}", "-".repeat(46));
+        for (name, preset) in presets {
+            let m = measure(preset);
+            println!(
+                "{:<8}  {:>10.6}  {:>10.6}  {:>12.6}",
+                name, m.rms, m.peak, m.crest
+            );
+        }
+        println!();
     }
 }

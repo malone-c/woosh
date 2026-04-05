@@ -68,6 +68,19 @@ Ready file (`~/.local/share/woosh/woosh.ready`) is written by ipc.rs after socke
 
 `dispatch()` returns `Option<String>`; QUIT never returns — `#[allow(clippy::unnecessary_wraps)]` suppresses the lint.
 
+## NOISE LEVEL BASELINE (measured 2026-04-05)
+
+`audio.rs` contains a `#[ignore]` test `measure_noise_levels` that skips the 1.5 s fade-in and measures 1 second of steady-state output at volume 1.0:
+
+| Preset | RMS    | Peak   | Crest Factor |
+|--------|--------|--------|--------------|
+| White  | 0.0997 | 0.1725 | 1.73         |
+| Pink   | 0.1041 | 0.3742 | 3.59         |
+| Brown  | 0.1047 | 0.4182 | 3.99         |
+
+All three types normalized to ~0.1 RMS at volume=1.0.
+Run with: `cargo test measure_noise_levels -- --nocapture --ignored`
+
 ## ANTI-PATTERNS
 
 - Never use tokio for the audio thread — `rodio::OutputStream` is `!Send`.

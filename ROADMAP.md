@@ -318,6 +318,13 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 - [x] Uses `send_fire_and_forget` (same pattern as `SET_EQ`); sends `SET_VOLUME {:.2}` to daemon
 - [x] Footer hint updated: `[ ]  vol` appended to EQ screen hint line
 
+#### 3.5.14 — Noise level normalization
+
+White noise is ~3× louder than Pink/Brown by RMS (measured baseline: White 0.580, Pink 0.194, Brown 0.199).
+
+- [x] Add `#[ignore]` test `measure_noise_levels` in `audio.rs` — prints RMS, peak, crest factor per preset (run with `cargo test measure_noise_levels -- --nocapture --ignored`)
+- [ ] Adjust per-preset scaling constants so all three types reach the same target RMS (≈ 0.20, matching Pink/Brown)
+
 #### 3.5.9 — Place Selector screen and dual volume controls
 
 - [ ] Add new `PlaceSelector` screen accessible via `l` key
