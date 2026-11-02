@@ -71,7 +71,8 @@ The single compiled binary (`woosh`) serves both roles:
 
 - **`woosh`** (no subcommand) — launches the TUI in a stopped state. If no daemon is running, it spawns one in the background first. No noise plays until the user selects a preset and presses `Enter`.
 - **`woosh pink|white|brown`** — quick command to play specific synthetic noise type without TUI, then exit.
-- **`woosh {place}`** — quick command to play YouTube place sound (e.g., `woosh paris`), then exit.
+- **`woosh {place}`** — quick command to play YouTube place sound (e.g., `woosh paris`), then exit. Any word that is not a subcommand is treated as a place.
+- **`woosh place {name}`** — the same, for names that match a subcommand (e.g. `woosh place status`).
 - **`woosh daemon`** — starts the daemon in the foreground (used internally by the auto-spawn path).
 - **`woosh stop`** — sends `QUIT` to the daemon and exits.
 - **`woosh status`** — prints current daemon state to stdout and exits.
@@ -91,10 +92,10 @@ Noise is synthesised algorithmically. No WAV/OGG files are bundled or loaded.
 | Type  | Algorithm | Description | Status |
 |-------|-----------|-------------|--------|
 | White | PRNG — uniform distribution over `[-1.0, 1.0]` | Equal energy per Hz; sounds bright/hissy | ✓ |
-| Pink  | Paul Kellet's 3-pole IIR approximation | Equal energy per octave; natural, balanced | **✓ Default** |
+| Pink  | Paul Kellet's refined 7-state IIR filter | Equal energy per octave; natural, balanced | **✓ Default** |
 | Brown | Integration of white noise (random walk) | High bass content; deep rumble | ✓ |
 
-**Default is pink noise** (changed from white in Phase 3.5). All three types are fully implemented.
+**Default is pink noise** (changed from white in Phase 3.5): the TUI's preset list starts on `[defaults] preset`, which defaults to `pink`. All three types are fully implemented, and each is scaled to about 0.1 RMS so switching presets does not change loudness.
 
 ### Implementation
 
@@ -102,25 +103,21 @@ A custom struct implements `rodio::Source`:
 
 ```
 struct NoiseSource {
-    sample_rate: u32,
-    channels: u16,
-    noise_type: NoiseType,
-    volume: f32,          // 0.0 – 1.0, applied per sample
-    eq_chain: EqChain,    // passthrough at MVP
-    rng: SmallRng,        // rand crate, seeded from entropy
-    // pink noise state
-    pink_b: [f64; 3],
+    rng: SmallRng,              // rand crate, seeded from entropy
+    dist: Uniform<f32>,         // [-1.0, 1.0]
+    algorithm: NoiseAlgorithm,  // White | Pink { b: [f32; 7] } | Brown { last: f32 }
+    fade: Fade,                 // fade-in / fade-out envelope (§ Audio Effects)
 }
 
 impl Iterator for NoiseSource { type Item = f32; … }
-impl Source for NoiseSource { … }
+impl Source for NoiseSource { … }   // mono, 44 100 Hz, endless
 ```
 
-`rodio::OutputStream` is created once at daemon startup and `NoiseSource` is appended to the sink. Volume changes mutate `NoiseSource.volume` in the next audio callback; a `Mutex<SharedState>` bridges IPC handler threads and the synthesis thread.
+Each `PLAY` creates a new `NoiseSource`, wraps it in an `EqProcessor`, and appends it to a new `rodio::Sink`. Volume is applied by the sink (`Sink::set_volume`). The `rodio::OutputStream` is opened lazily (§ Audio Daemon). An `Arc<Mutex<DaemonState>>` bridges the IPC handler tasks and the audio thread.
 
 ### Sample Rate
 
-Default 44 100 Hz, stereo. Configurable in `~/.config/woosh/config.toml`.
+Fixed at 44 100 Hz, mono, for both channels. Not configurable.
 
 ---
 
@@ -128,28 +125,28 @@ Default 44 100 Hz, stereo. Configurable in `~/.config/woosh/config.toml`.
 
 ### Overview
 
-Woosh can stream ambient sounds from YouTube via the `mpv` media player with `yt-dlp` integration. Users type `woosh {place}` (e.g., `woosh tokyo`) and the daemon searches YouTube for "walking through {place}", picks a random video from results, skips the first 5 minutes (to avoid intro music), and streams audio-only to a second audio channel.
+Woosh can stream ambient sounds from YouTube via the `mpv` media player with `yt-dlp` integration. Users type `woosh {place}` (e.g., `woosh tokyo`) and the daemon searches YouTube for "walking through {place}", takes the first result at least 10 minutes long, skips the first 5 minutes (to avoid intro music), and streams audio-only to a second audio channel.
 
 ### Architecture
 
 Place sounds run in a **separate audio channel** from synthetic noise. The daemon spawns an `mpv` subprocess with these flags:
 
 ```bash
-mpv "ytsearch1:walking through {place}" \
-    --no-video \
-    --audio-display=no \
-    --ytdl \
+mpv "ytdl://ytsearch10:walking through {place}" \
+    --ytdl-raw-options=match-filter=duration>=600 \
     --start=300 \
-    --af=aformat=s16:44100 \
-    --ao=pcm:file=/dev/stdout
+    --no-video --no-terminal --audio-display=no \
+    --ytdl-format=bestaudio/best \
+    --audio-format=s16 --audio-samplerate=44100 --audio-channels=mono \
+    --ao=pcm --ao-pcm-waveheader=no --ao-pcm-file=/dev/stdout
 ```
 
-- `ytsearch1:` — YouTube search, pick first result (randomization handled by query variation)
+- `ytdl://ytsearch10:` + `match-filter=duration>=600` — YouTube search via yt-dlp, keeping results of at least 10 minutes; mpv plays the first and continues with the next when it ends (mpv needs the `ytdl://` prefix to hand a search to yt-dlp)
 - `--start=300` — skip first 5 minutes (300 seconds)
-- `--ao=pcm:file=/dev/stdout` — output raw PCM to stdout instead of system audio device
-- `--af=aformat=s16:44100` — force 16-bit signed PCM at 44.1 kHz to match synth sample rate
+- `--audio-format=s16 --audio-samplerate=44100 --audio-channels=mono` — 16-bit signed mono PCM at 44.1 kHz, matching the synth channel
+- `--ao=pcm … --ao-pcm-file=/dev/stdout` — raw PCM to stdout instead of the system audio device
 
-The daemon captures stdout via `BufReader<ChildStdout>`, wraps it as a `rodio::Source`, applies EQ and volume, and appends it to the `place_sink`.
+A reader thread converts mpv's stdout to `f32` samples in a buffer that `MpvSource` (a `rodio::Source`) plays from, through the place EQ and sink volume. `--ao=pcm` decodes faster than real time, so the reader stops reading while 5 s of audio is buffered; mpv then blocks on the full pipe, which paces it to playback speed. While mpv is still buffering, the source plays silence. When the stream ends, the place channel returns to `stopped`.
 
 ### Single Place Rule
 
@@ -159,7 +156,7 @@ Only **one place sound can play at a time**. If the user requests a new place wh
 
 The user can play **one synthetic noise (white/pink/brown) + one place sound simultaneously**. Each channel has independent volume control but shares a unified EQ by default (see § EQ System).
 
-### Reverb Effect
+### Reverb Effect (planned, ROADMAP 3.5.10)
 
 Place sounds can optionally have reverb applied via `mpv`'s `--af=reverb` audio filter or post-processing in the daemon. Default: **off** (configurable in `config.toml`). Adds atmospheric depth to place sounds.
 
@@ -168,7 +165,7 @@ Place sounds can optionally have reverb applied via `mpv`'s `--af=reverb` audio 
 - **mpv** — installed on user's system, must be in `$PATH`
 - **yt-dlp** — required for YouTube search and streaming; mpv calls this automatically if installed
 
-If `mpv` or `yt-dlp` is missing, place sound commands gracefully fail with an error message and synth-only mode remains available.
+If `mpv` or `yt-dlp` is not on the daemon's `PATH`, `PLAY_PLACE` replies `ERROR mpv not found in PATH; …` (or `yt-dlp`), and synth-only mode remains available.
 
 ---
 
@@ -178,24 +175,24 @@ If `mpv` or `yt-dlp` is missing, place sound commands gracefully fail with an er
 
 All audio sources (synth noise and place sounds) **fade in over 1.5 seconds** when playback starts. This prevents sudden loud bursts that can be jarring.
 
-**Implementation:** `NoiseSource` and `MpvSource` each hold a `fade_samples: u32` counter (0 → 66,150). Each sample is multiplied by `min(fade_samples / 66_150.0, 1.0)` and the counter increments by 1 (capped at 66,150). Because sources are recreated on every `PLAY`/`PLAY_PLACE` command, the counter resets automatically.
+**Implementation:** `NoiseSource` and `MpvSource` each hold a `Fade` envelope with an `f32` fade-in counter (0 → `FADE_SAMPLES` = 66,150). Each sample is multiplied by `counter / 66_150.0` and the counter increments by 1 (capped at 66,150). Because sources are recreated on every `PLAY`/`PLAY_PLACE` command, the counter resets automatically. `MpvSource` only advances it on real audio, so the fade starts when mpv's audio does.
 
 ### Fade-Out
 
 When playback stops (via `STOP` or `STOP_PLACE`), audio **fades out over 1.5 seconds** before the source is silenced. This avoids abrupt cuts.
 
-**Implementation:** `NoiseSource` and `MpvSource` each hold a shared `fade_out: Arc<AtomicBool>` flag and a `fade_out_samples: u32` counter. When the audio thread receives `STOP`/`STOP_PLACE`, it sets the flag via the shared Arc. Subsequent samples are then multiplied by a linearly decreasing envelope (`1.0 − fade_out_samples / 66_150.0`). Once `fade_out_samples` reaches 66,150 the source returns `None`, signalling end-of-stream to rodio; the sink drains naturally without an explicit pause or drop.
+**Implementation:** each `Fade` holds a shared `Arc<AtomicBool>` fade-out flag and an `f32` fade-out counter. When the audio thread receives `STOP`/`STOP_PLACE` (or shuts down), it sets the flag via the shared Arc. Subsequent samples are then multiplied by a linearly decreasing envelope (`1.0 − fade_out_samples / 66_150.0`). Once `fade_out_samples` reaches 66,150 the source returns `None`, signalling end-of-stream to rodio; the sink drains naturally without an explicit pause or drop.
 
 ### Volume Defaults
 
 | Channel | Default Volume | Notes |
 |---------|----------------|-------|
-| Synth   | 0.5            | Reduced from 0.8 to avoid excessive loudness |
+| Synth   | 0.8            | `[defaults] volume`; ROADMAP 3.5.10 proposes 0.5 |
 | Place   | 0.4            | Slightly quieter than synth for balanced mixing |
 
 Users can adjust volumes independently via IPC commands or TUI controls.
 
-### Reverb (Optional)
+### Reverb (Optional, planned)
 
 Place sounds can have reverb effect applied for atmospheric ambience. Configured via `~/.config/woosh/config.toml`:
 
@@ -213,38 +210,39 @@ Reverb adds CPU overhead (mpv subprocess filter chain), so it defaults to disabl
 
 ### Responsibilities
 
-- Own the `rodio::OutputStream` and two `Sink` instances (synth + place).
+- Own the `rodio::OutputStream` and one `Sink` per playing channel (synth + place).
 - Run the synthesis loop for synthetic noise (via the `rodio::Source` implementation).
-- Manage `mpv` subprocess for YouTube place sounds (spawn, monitor, kill).
+- Manage `mpv` subprocess for YouTube place sounds (spawn, detect end of stream, kill).
 - Listen on the Unix socket and handle IPC commands for both channels.
-- Maintain fixed-size ring buffers of recent PCM samples for the visualizer (one per channel).
-- Write and clean up the PID file.
+- Write and clean up the PID, socket and ready files.
 
 ### Lifecycle
 
-1. On first `woosh` invocation, the TUI checks for `woosh.pid`.
-2. If PID file absent or stale (process not alive), spawn `woosh daemon` as a detached child using `daemonize`.
-3. Wait up to 500 ms for the socket file to appear, then connect.
+1. On first `woosh` invocation, the CLI checks for `woosh.pid`.
+2. If PID file absent or stale (process not alive), it spawns `woosh daemon`, which detaches using `daemonize`.
+3. Wait up to 500 ms for both the socket and `woosh.ready` (written once the socket accepts connections), then connect.
 4. Daemon starts in a **stopped state** — no audio plays until the first `PLAY` command is received.
-5. The `rodio::OutputStream` (audio device claim) is opened **lazily** on the first `PLAY` or `PLAY_PLACE` command and released automatically once both channels have stopped and their fade-outs have drained. This allows Bluetooth headphones to hand off to other apps while woosh is idle.
-6. When both channels have been stopped and no clients are connected for `idle_timeout_mins` minutes (configurable, default 15), the daemon auto-shuts down. Set `idle_timeout_mins = 0` to disable auto-shutdown.
-7. On `QUIT` command or `SIGTERM`, flush audio, remove socket and PID file, exit.
+5. The `rodio::OutputStream` (audio device claim) is opened **lazily** on the first `PLAY` or `PLAY_PLACE` command and released automatically once both channels have stopped and their fade-outs have drained (or the place stream has ended). This allows Bluetooth headphones to hand off to other apps while woosh is idle. If the device cannot be opened, the daemon keeps the request, retries every 5 s, and reports `device=unavailable` in `STATUS`.
+6. When both channels have been stopped and no clients are connected for `idle_timeout_mins` minutes (configurable, default 15), the daemon shuts down as for `QUIT`. An open TUI holds a connection, so it prevents this. Set `idle_timeout_mins = 0` to disable auto-shutdown.
+7. On `QUIT`, `SIGTERM` or idle timeout: remove the socket, ready and PID files, fade out both channels (up to 2 s), kill mpv, exit.
 
 ### PID & Socket Paths
 
-| File | Path |
-|------|------|
-| PID file | `~/.local/share/woosh/woosh.pid` |
-| Unix socket | `~/.local/share/woosh/woosh.sock` |
+All runtime files live in the data directory from `dirs::data_dir()`:
 
-Both paths respect `$XDG_DATA_HOME` if set.
+| Platform | Directory |
+|----------|-----------|
+| macOS | `~/Library/Application Support/woosh/` |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/woosh/` |
+
+Files: `woosh.pid`, `woosh.sock`, `woosh.ready`, `woosh.log`.
 
 ### Daemonize
 
 Uses the `daemonize` crate:
 
 - Double-fork to detach from the controlling terminal.
-- Redirect stdin/stdout/stderr to `/dev/null`.
+- Append stdout/stderr to `woosh.log`.
 - Writes PID to `woosh.pid` after fork.
 
 ---
@@ -273,8 +271,10 @@ A simple line-oriented text protocol over a Unix domain socket. Each message is 
 | **Global** |
 | `STATUS` | `STATUS` | Request current state of both channels |
 | `QUIT` | `QUIT` | Shut down daemon (stops both channels, kills mpv) |
-| `SAVE_PRESET <name>` | `SAVE_PRESET focus` | Save current state (both channels) as a named preset |
-| `DELETE_PRESET <name>` | `DELETE_PRESET focus` | Remove a named preset |
+| `SAVE_PRESET <name>` | `SAVE_PRESET focus` | Save current state (both channels) as a named preset (Phase 4, not built) |
+| `DELETE_PRESET <name>` | `DELETE_PRESET focus` | Remove a named preset (Phase 4, not built) |
+
+Commands are case-insensitive. `QUIT` gets no reply; the daemon closes the connection.
 
 ### Daemon → Client
 
@@ -282,17 +282,16 @@ A simple line-oriented text protocol over a Unix domain socket. Each message is 
 |----------|---------|-------------|
 | `OK` | `OK` | Command accepted |
 | `ERROR <msg>` | `ERROR unknown preset` | Command rejected with reason |
-| `STATUS <fields>` | `STATUS synth=pink:playing:0.5 place=paris:playing:0.4` | State snapshot (both channels) |
-| `PLACE_STATUS <fields>` | `PLACE_STATUS playing location=tokyo volume=0.4` | Place channel status |
-| `SAMPLES <hex>` | `SAMPLES 3f800000...` | Batch of PCM samples (little-endian f32 hex) for visualizer |
+| `STATUS <fields>` | `STATUS synth=pink:running:0.50 place=paris:running:0.40 device=ok` | State snapshot: `<preset or none>:<running\|stopped>:<volume>` per channel, and `device=ok\|unavailable` |
+| `PLACE_STATUS <fields>` | `PLACE_STATUS place=tokyo:running:0.40` | Place channel status |
 | `EQ <values>` | `EQ 0.0 0.0 -3.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0` | Synth EQ response (10 bands) |
 | `PLACE_EQ <values>` | `PLACE_EQ 0.0 0.0 -3.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0` | Place EQ response (10 bands) |
 
-The TUI polls `STATUS` every tick and subscribes to unsolicited `SAMPLES` pushes after sending a `SUBSCRIBE_SAMPLES` command (added in Phase 2).
+The TUI keeps one connection open and sends `STATUS` and `GET_EQ` every tick (33 ms). Every command, including volume and EQ changes, waits for its one-line reply.
 
 ### Concurrency
 
-The daemon spawns one Tokio task per accepted client connection. A shared `Arc<Mutex<DaemonState>>` protects mutable state (current preset, volume, EQ params, sample ring buffer).
+The daemon spawns one Tokio task per accepted client connection. A shared `Arc<Mutex<DaemonState>>` protects mutable state (per-channel play state, volume and EQ gains; current preset and place; device availability). The IPC handler records each request; the audio thread records each outcome.
 
 ---
 
@@ -309,12 +308,14 @@ The daemon spawns one Tokio task per accepted client connection. A shared `Arc<M
 The TUI features a **centered, colorful layout with ASCII art**:
 
 - **Centered frame:** Main content area (max 80 cols × 24 rows) with colored borders and padding
-- **ASCII art logo:** "WOOSH" banner in figlet font displayed in title bar
-- **Dithered backgrounds:** Box-drawing characters (`░▒▓█`) create ambient wave patterns in margins
-- **Color palette:** Blues, purples, pinks via `Color::Rgb` for aesthetic, calming vibes
+- **Logo:** "ＷＯＯＳＨ" wordmark in fullwidth letters in the title bar
+- **Dithered backgrounds:** shade characters (`░▒`) in a diagonal pattern fill the margins
+- **Color palette:** warm greys and creams via `Color::Rgb`, with a cyan border
 - **Border style:** Cyan borders around main content frame
 
 ### Screens
+
+The mockups show the full design; parts marked planned are not built yet.
 
 #### Screen 1 — Preset Selector
 
@@ -341,10 +342,10 @@ The TUI features a **centered, colorful layout with ASCII art**:
 ░░▒▒▓▓  Ambient waves pattern in margins  ▓▓▒▒░░
 ```
 
-- Arrow keys navigate the list.
-- `Enter` sends `PLAY <preset>` to daemon.
-- `l` opens Place Selector (Screen 4).
-- `→` or `Tab` switches to Equalizer (Screen 2, changed from Visualizer).
+- `↑`/`↓` (or `j`/`k`) navigate the list, which starts on `[defaults] preset`.
+- `Enter` or `Space` sends `PLAY <preset>` to daemon and opens the Equalizer.
+- `e` or `Tab` switches to Equalizer (Screen 2).
+- `l` opens Place Selector (Screen 4) — planned, ROADMAP 3.5.9.
 
 #### Screen 2 — Equalizer (Default Screen)
 
@@ -364,13 +365,14 @@ The TUI features a **centered, colorful layout with ASCII art**:
        ╚═══════════════════════════════════════════════╝
 ```
 
-- `←`/`→` navigate EQ bands, `↑`/`↓` adjust gain ±1 dB.
+- `←`/`→` navigate EQ bands, `↑`/`↓` adjust gain ±1 dB (vim keys `h`/`l`/`k`/`j` also work).
 - `r` resets all bands to 0 dB (flat).
-- `s` toggles Spectrum Analyzer (Screen 3, optional feature).
-- `p` returns to Preset Selector.
+- `s` toggles play/stop, resuming the last preset.
+- `[`/`]` adjust synth volume ±5 %.
+- `p`, `Esc`, `Tab` or `Backspace` returns to Preset Selector.
 - Selected band highlighted in yellow.
 
-#### Screen 3 — Spectrum Analyzer (Toggle Feature)
+#### Screen 3 — Spectrum Analyzer (removed in ROADMAP 3.5.8)
 
 ```
        ╔═══════════════════════════════════════════════╗
@@ -390,7 +392,7 @@ The TUI features a **centered, colorful layout with ASCII art**:
 - Spectrum bars update at ~30 fps.
 - `s` returns to Equalizer screen.
 
-#### Screen 4 — Place Selector
+#### Screen 4 — Place Selector (planned, ROADMAP 3.5.9)
 
 ```
        ╔═══════════════════════════════════════════════╗
@@ -415,7 +417,7 @@ The TUI features a **centered, colorful layout with ASCII art**:
 - `Shift+←`/`→` adjust place volume.
 - `Esc` returns to Preset Selector.
 
-**Note:** Equalizer (Screen 2) is now the **default landing screen** after preset selection. Spectrum analyzer (Screen 3) is an optional toggle feature accessed via `s` key.
+**Note:** Equalizer (Screen 2) is the landing screen after preset selection. The spectrum analyzer (Screen 3) was removed.
 
 ### Mouse Support
 
@@ -427,49 +429,30 @@ The TUI features a **centered, colorful layout with ASCII art**:
 
 ### Key Bindings (global)
 
-| Key | Action |
-|-----|--------|
-| `q` | Quit TUI (daemon keeps running) |
-| `Q` (shift) | Quit TUI and stop daemon (kills both channels + mpv) |
-| `p` | Go to Preset Selector |
-| `e` | Go to Equalizer (default screen) |
-| `s` | Toggle Spectrum Analyzer (from Equalizer screen) |
-| `l` | Go to Place Selector |
-| `←` / `→` | Synth volume down / up (Preset screen); select band (EQ screen) |
-| `[` / `]` | Synth volume down / up (EQ screen, ±5 % per press) |
-| `Shift+←` / `Shift+→` | Place volume down / up (Place Selector) |
-| `↑` / `↓` | Navigate list (Preset screen); adjust EQ gain ±1 dB (EQ screen) |
-| `Enter` | Confirm selection / start playback |
-| `r` | Reset all EQ bands to 0 dB (flat) |
-| `Esc` | Return to previous screen |
-| `?` | Toggle help overlay |
+| Key | Action | Status |
+|-----|--------|--------|
+| `q` | Quit TUI (daemon keeps running) | ✓ |
+| `Q` (shift) | Quit TUI and stop daemon (fades out both channels, kills mpv) | ✓ |
+| `p` / `Esc` / `Tab` | Go to Preset Selector (from Equalizer) | ✓ |
+| `e` / `Tab` | Go to Equalizer (from Presets) | ✓ |
+| `s` | Toggle play/stop (Equalizer screen) | ✓ |
+| `l` | Go to Place Selector | planned (3.5.9) |
+| `←` / `→` | Select band (EQ screen) | ✓ |
+| `←` / `→` | Synth volume down / up (Preset screen) | planned (3.5.9) |
+| `[` / `]` | Synth volume down / up (EQ screen, ±5 % per press) | ✓ |
+| `Shift+←` / `Shift+→` | Place volume down / up (Place Selector) | planned (3.5.9) |
+| `↑` / `↓` | Navigate list (Preset screen); adjust EQ gain ±1 dB (EQ screen) | ✓ |
+| `Enter` / `Space` | Start playback of the highlighted preset | ✓ |
+| `r` | Reset all EQ bands to 0 dB (flat) | ✓ |
+| `?` | Toggle help overlay | planned (Phase 4) |
+
+The status bar shows whether the TUI is connected to the daemon (it reconnects automatically) and whether the audio device is unavailable.
 
 ---
 
 ## Spectrum Analyzer
 
-### Data Flow
-
-```
-NoiseSource → ring buffer (daemon) → SAMPLES push (IPC) → TUI FFT → BarChart
-```
-
-1. `NoiseSource` writes each generated sample into a lock-free ring buffer (`ringbuf` crate, capacity 4096 f32 samples).
-2. The daemon's sample-push task reads the ring buffer every ~33 ms and sends a `SAMPLES` message to all subscribed TUI clients.
-3. The TUI receives the sample batch, runs an FFT via the `spectrum-analyzer` crate (which wraps `rustfft`), and maps frequency bins to bar heights.
-4. A Hann window is applied before the FFT to reduce spectral leakage.
-5. Bars are rendered with `ratatui::widgets::BarChart`, logarithmically scaled on the frequency axis.
-
-### Parameters
-
-| Parameter | Value |
-|-----------|-------|
-| FFT window size | 2048 samples |
-| Overlap | 50 % (1024-sample hop) |
-| Window function | Hann |
-| Frequency axis | Log scale, 20 Hz – 20 kHz |
-| Number of display bars | 24 |
-| Update rate | ~30 fps |
+Removed in ROADMAP 3.5.8: the Equalizer replaced it as the main screen, and the sample-streaming pipeline (`SUBSCRIBE_SAMPLES`, `ringbuf`, `spectrum-analyzer`) was deleted.
 
 ---
 
@@ -477,7 +460,7 @@ NoiseSource → ring buffer (daemon) → SAMPLES push (IPC) → TUI FFT → BarC
 
 ### Overview
 
-Woosh features **two independent 10-band graphic EQs**: one for synthetic noise, one for place sounds. By default, they **stay in sync** — adjusting EQ in the TUI updates both channels simultaneously. Advanced users can enable `advanced_eq_mode = true` in `config.toml` to control each EQ independently.
+Woosh features **two independent 10-band graphic EQs**: one for synthetic noise, one for place sounds. The TUI keeps them **in sync** — adjusting EQ sends both `SET_EQ` and `SET_PLACE_EQ`. Over IPC each can be set independently. (`advanced_eq_mode` for independent control in the TUI is planned.)
 
 ### Bands
 
@@ -502,7 +485,7 @@ Gain is adjustable in 1 dB steps. Default is 0 dB (flat) for all bands.
 
 Implemented in `src/daemon/eq.rs`. Each band is a 2nd-order biquad peaking filter using the Audio EQ Cookbook coefficients, computed in the Direct Form II Transposed structure for numerical stability.
 
-`EqProcessor<S>` wraps a `rodio::Source` (currently `NoiseSource`) and applies all 10 filters in series per sample. Gains are shared between the audio thread and the IPC handler via `Arc<Mutex<[f32; 10]>>`; `EqProcessor` polls for updates every 512 samples using `try_lock` (same pattern as the sample visualizer buffer). Filter state is never reset on coefficient changes — new coefficients take effect smoothly within ~1 buffer (~12 ms), avoiding audible clicks.
+`EqProcessor<S>` wraps a `rodio::Source` (`NoiseSource` or `MpvSource`) and applies all 10 filters in series per sample. Each channel's gains live in an `Arc<Mutex<[f32; 10]>>` that the audio thread updates on `SET_EQ`/`SET_PLACE_EQ`; `EqProcessor` polls for updates every 512 samples using `try_lock`, so the audio callback never blocks. Filter state is never reset on coefficient changes — new coefficients take effect smoothly within ~1 buffer (~12 ms), avoiding audible clicks.
 
 At exactly 0 dB, the identity filter `{b0:1, b1:0, b2:0, a1:0, a2:0}` is used for bit-perfect pass-through with no state accumulation.
 
@@ -525,11 +508,9 @@ SYNC_EQ <bool>                        # enable/disable EQ sync mode
 
 The EQ screen (Screen 2) is now the **default landing screen** (changed from spectrum analyzer). It shows a `BarChart` of 10 bands (bar height maps ±12 dB → 0–24 range) with the selected band highlighted in yellow. A readout line beneath shows all gains numerically.
 
-Key bindings: `←`/`→` navigate bands, `↑`/`↓` adjust ±1 dB, `r` resets all to flat, `[`/`]` adjust synth volume ±5 %, `s` toggles spectrum analyzer, `Esc` or `p` returns to the Preset Selector.
+Key bindings: `←`/`→` navigate bands, `↑`/`↓` adjust ±1 dB, `r` resets all to flat, `[`/`]` adjust synth volume ±5 %, `s` toggles play/stop, `Esc` or `p` returns to the Preset Selector.
 
-When **advanced_eq_mode = false** (default): Adjusting EQ updates both synth and place channels simultaneously.
-
-When **advanced_eq_mode = true**: TUI shows two separate EQ displays (synth and place) with a toggle to switch between them.
+Adjusting EQ updates both synth and place channels simultaneously. A planned `advanced_eq_mode = true` would show two separate EQ displays (synth and place) with a toggle to switch between them.
 
 > **Note:** EQ gains are not currently persisted to `config.toml` — they reset to flat (0 dB) when the daemon restarts. Persistence is planned for Phase 4.
 
@@ -545,14 +526,13 @@ When **advanced_eq_mode = true**: TUI shows two separate EQ displays (synth and 
 | `tokio` | 1 (full) | Async runtime |
 | `rand` | 0.8 | PRNG for noise generation |
 | `daemonize` | 0.5 | UNIX process daemonization |
-| `ringbuf` | 0.4 | Lock-free ring buffer (sample sharing) |
-| `spectrum-analyzer` | 1.5 | FFT + frequency analysis (wraps rustfft) |
 | `serde` | 1 | Config serialization |
 | `toml` | 0.8 | Config file parsing |
 | `dirs` | 5 | XDG-aware path resolution |
 | `anyhow` | 1 | Error handling |
 | `tracing` | 0.1 | Structured logging (daemon) |
-| `tracing-subscriber` | 0.3 | Log output to file |
+| `tracing-subscriber` | 0.3 | Log output (daemon: file; CLI/TUI: stderr), `RUST_LOG` filter |
+| `libc` | 0.2 | `kill(pid, 0)` daemon liveness check |
 | `clap` | 4 | CLI argument parsing (subcommands) |
 
 ---
@@ -567,90 +547,91 @@ woosh/
 ├── Cargo.lock
 ├── SPEC.md
 ├── ROADMAP.md
+├── AGENTS.md              # Agent runbook (plus src/daemon/ and src/tui/)
+├── docs/logging.md
 ├── src/
-│   ├── main.rs            # CLI entry point, subcommand dispatch
+│   ├── main.rs            # CLI entry point, subcommand dispatch, daemon auto-spawn
+│   ├── lib.rs
+│   ├── config.rs          # Config struct, load / write defaults
 │   ├── daemon/
-│   │   ├── mod.rs         # Daemon entry point, lifecycle
-│   │   ├── audio.rs       # NoiseSource, rodio setup
-│   │   ├── ipc.rs         # Unix socket listener, command handler
-│   │   └── state.rs       # DaemonState, ring buffer
-│   ├── tui/
-│   │   ├── mod.rs         # TUI entry point, event loop
-│   │   ├── app.rs         # App state machine
-│   │   ├── screens/
-│   │   │   ├── presets.rs # Screen 1
-│   │   │   └── visualizer.rs # Screen 2
-│   │   ├── widgets/
-│   │   │   ├── spectrum.rs # FFT + BarChart wrapper
-│   │   │   └── volume.rs   # Volume bar widget
-│   │   └── client.rs      # IPC client (socket reads/writes)
-│   └── config.rs          # Config struct, load/save
+│   │   ├── mod.rs         # Daemon entry point, shutdown
+│   │   ├── lifecycle.rs   # Paths, daemonize, PID, logging
+│   │   ├── state.rs       # DaemonState, Channel, NoisePreset
+│   │   ├── ipc.rs         # Unix socket listener, command handler, idle watchdog
+│   │   ├── audio.rs       # Audio thread, NoiseSource, Fade
+│   │   ├── eq.rs          # Biquad filters, EqProcessor
+│   │   └── mpv.rs         # MpvSource (place sounds)
+│   └── tui/
+│       ├── mod.rs         # TUI entry point, event loop, key handling, rendering
+│       ├── app.rs         # App state
+│       ├── client.rs      # IPC client (persistent connection, reconnect)
+│       └── art.rs         # Logo, dithered background
 └── tests/
-    ├── ipc_protocol.rs
-    └── noise_source.rs
+    ├── ipc_integration.rs
+    └── daemon_startup_race_test.rs
 ```
 
 ### Runtime
 
 ```
-~/.config/woosh/
-└── config.toml
+config:  ~/Library/Application Support/woosh/config.toml   (macOS)
+         ${XDG_CONFIG_HOME:-~/.config}/woosh/config.toml   (Linux)
 
-~/.local/share/woosh/
-├── woosh.pid
-├── woosh.sock
-└── woosh.log
+data:    ~/Library/Application Support/woosh/              (macOS)
+         ${XDG_DATA_HOME:-~/.local/share}/woosh/           (Linux)
+         ├── woosh.pid
+         ├── woosh.sock
+         ├── woosh.ready
+         └── woosh.log
 ```
 
 ---
 
 ## Configuration
 
-`~/.config/woosh/config.toml`:
+`config.toml` (path in § File & Directory Layout). Implemented keys:
 
 ```toml
-[audio]
-sample_rate = 44100
-channels = 2        # 1 = mono, 2 = stereo
-
 [defaults]
-preset = "pink"     # changed from "white"
-volume = 0.5        # 0.0 – 1.0, reduced from 0.8
-
-[place]
-enabled = true
-volume = 0.4        # default place sound volume
-reverb = false      # reverb effect for place sounds
-reverb_amount = 0.3 # 0.0 – 1.0, only used if reverb = true
-
-[eq]
-enabled = false
-advanced_eq_mode = false  # if true, control synth and place EQs independently
-low_shelf_gain  = 0.0     # dB
-peak1_gain      = 0.0
-peak2_gain      = 0.0
-high_shelf_gain = 0.0
-
-[tui]
-default_screen = "equalizer"  # "equalizer" or "presets"
-show_ascii_art = true
-color_scheme = "default"      # default = blues/purples/pinks
+preset = "pink"           # preset highlighted when the TUI opens
+volume = 0.8              # synth volume the daemon starts with (0.0 – 1.0)
 
 [daemon]
-log_level = "info"            # error | warn | info | debug | trace
-idle_timeout_mins = 15        # auto-shutdown after N minutes idle (0 = never)
+idle_timeout_mins = 15    # auto-shutdown after N minutes idle (0 = never)
 ```
 
-On first run, if the file is absent, woosh writes the defaults above.
+On first run, if the file is absent, woosh writes these defaults. Missing sections or keys take their defaults, and unknown keys are ignored. If the file cannot be parsed, woosh logs a warning and uses all defaults.
+
+Planned keys (not read yet):
+
+```toml
+[place]                   # ROADMAP 3.5.10
+enabled = true
+volume = 0.4
+reverb = false
+reverb_amount = 0.3
+
+[eq]
+advanced_eq_mode = false  # control synth and place EQs independently
+
+[tui]                     # ROADMAP 3.5.10
+default_screen = "equalizer"
+show_ascii_art = true
+color_scheme = "default"
+
+[daemon]
+log_level = "info"        # today, set RUST_LOG instead
+```
 
 ---
 
 ## Error Handling
 
 - All recoverable errors use `anyhow::Result`.
-- Audio device errors (e.g., device disconnected) are logged and trigger a 5-second retry loop in the daemon; the TUI shows a status banner.
-- Socket connection failures in the TUI trigger an automatic reconnect with exponential backoff (100 ms, 200 ms, 400 ms, max 5 s).
-- Unknown IPC commands return `ERROR unknown command` and are otherwise ignored.
+- If the audio device cannot be opened, the error is logged and the daemon retries every 5 seconds; `STATUS` reports `device=unavailable` and the TUI shows a status banner.
+- Socket connection failures in the TUI trigger an automatic reconnect with exponential backoff (100 ms, 200 ms, 400 ms, max 5 s); the status bar shows "disconnected" meanwhile and the TUI keeps running.
+- Unknown IPC commands return `ERROR unknown command: <VERB>` and are otherwise ignored. Invalid arguments (unknown preset, NaN volume, bad EQ band) return `ERROR <reason>`.
+- CLI play commands print the daemon's `ERROR` reply and exit non-zero.
 
 ---
 

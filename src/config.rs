@@ -1,42 +1,30 @@
+use crate::daemon::state::NoisePreset;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// User-configurable defaults applied when the daemon first starts.
+/// Playback defaults.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DefaultsConfig {
-    /// Which noise preset to play on startup (`"white"`, `"pink"`, `"brown"`).
-    pub preset: String,
-    /// Initial volume (0.0–1.0).
+    /// Preset highlighted when the TUI opens.
+    pub preset: NoisePreset,
+    /// Synth volume (0.0–1.0) the daemon starts with.
     pub volume: f32,
 }
 
 impl Default for DefaultsConfig {
     fn default() -> Self {
         Self {
-            preset: "white".to_owned(),
+            preset: NoisePreset::Pink,
             volume: 0.8,
-        }
-    }
-}
-
-/// Audio-engine settings.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AudioConfig {
-    /// Sample rate passed to the noise source (Hz).
-    pub sample_rate: u32,
-}
-
-impl Default for AudioConfig {
-    fn default() -> Self {
-        Self {
-            sample_rate: 44_100,
         }
     }
 }
 
 /// Daemon lifecycle settings.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DaemonConfig {
     /// Minutes of inactivity (no clients connected and both channels stopped)
     /// before the daemon automatically shuts down. Set to `0` to disable.
@@ -51,21 +39,19 @@ impl Default for DaemonConfig {
     }
 }
 
-/// Top-level configuration struct.
+/// Top-level configuration. Missing sections and keys take their defaults.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
-    /// Default playback settings.
     pub defaults: DefaultsConfig,
-    /// Audio engine settings.
-    pub audio: AudioConfig,
-    /// Daemon lifecycle settings.
     pub daemon: DaemonConfig,
 }
 
-/// Returns the path to the config file (`~/.config/woosh/config.toml`).
+/// Returns the path to the config file: `~/Library/Application Support/woosh/config.toml`
+/// on macOS, `${XDG_CONFIG_HOME:-~/.config}/woosh/config.toml` on Linux.
 ///
 /// # Errors
-/// Returns an error if the XDG config directory cannot be determined.
+/// Returns an error if the config directory cannot be determined.
 pub fn config_path() -> Result<PathBuf> {
     let base = dirs::config_dir().context("cannot determine config directory")?;
     Ok(base.join("woosh").join("config.toml"))
@@ -91,4 +77,24 @@ pub fn load() -> Result<Config> {
     let config: Config = toml::from_str(&content)
         .with_context(|| format!("cannot parse config: {}", path.display()))?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use crate::daemon::state::NoisePreset;
+
+    #[test]
+    fn missing_sections_and_keys_use_defaults() {
+        let config: Config = toml::from_str("[defaults]\nvolume = 0.3\n").unwrap();
+        assert!((config.defaults.volume - 0.3).abs() < f32::EPSILON);
+        assert_eq!(config.defaults.preset, NoisePreset::Pink);
+        assert_eq!(config.daemon.idle_timeout_mins, 15);
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored() {
+        let config: Config = toml::from_str("[audio]\nsample_rate = 44100\n").unwrap();
+        assert_eq!(config.daemon.idle_timeout_mins, 15);
+    }
 }

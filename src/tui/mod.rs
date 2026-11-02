@@ -1,6 +1,6 @@
 pub mod app;
-pub mod client;
 mod art;
+pub mod client;
 
 use anyhow::Result;
 use app::{App, Screen};
@@ -12,7 +12,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Bar, BarChart, BarGroup, Block, Borders, List, ListItem, ListState, Paragraph,
+};
 use ratatui::Terminal;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -21,22 +23,26 @@ use tokio::time::MissedTickBehavior;
 use crate::daemon::eq::{BAND_FREQS, GAIN_MAX, GAIN_MIN, N_BANDS};
 use crate::daemon::state::{NoisePreset, PlayState};
 
-const BORDER_CYAN:         Color = Color::Rgb(137, 179, 182);
-const TITLE_FG:            Color = Color::Rgb(236, 225, 215);
-const TITLE_BG:            Color = Color::Rgb(52, 48, 44);
-const FOOTER_FG:           Color = Color::Rgb(193, 167, 142);
-const STATUS_FG:           Color = Color::Rgb(134, 116, 98);
+const BORDER_CYAN: Color = Color::Rgb(137, 179, 182);
+const TITLE_FG: Color = Color::Rgb(236, 225, 215);
+const TITLE_BG: Color = Color::Rgb(52, 48, 44);
+const FOOTER_FG: Color = Color::Rgb(193, 167, 142);
+const STATUS_FG: Color = Color::Rgb(134, 116, 98);
 const PRESET_HIGHLIGHT_BG: Color = Color::Rgb(64, 58, 54);
 const PRESET_HIGHLIGHT_FG: Color = Color::Rgb(236, 225, 215);
-const EQ_SELECTED_FG:      Color = Color::Rgb(235, 192, 109);
-const PLAYING_DOT_FG:      Color = Color::Rgb(133, 182, 149);
-const STOPPED_DOT_FG:      Color = Color::Rgb(134, 116, 98);
-const INNER_BORDER_FG:     Color = Color::Rgb(64, 58, 54);
+const EQ_BAR_FG: Color = Color::Rgb(163, 169, 206);
+const EQ_SELECTED_FG: Color = Color::Rgb(235, 192, 109);
+const PLAYING_DOT_FG: Color = Color::Rgb(133, 182, 149);
+const STOPPED_DOT_FG: Color = Color::Rgb(134, 116, 98);
+const INNER_BORDER_FG: Color = Color::Rgb(64, 58, 54);
+
+/// Volume change per `[` / `]` press.
+const VOLUME_STEP: f32 = 0.05;
 
 /// Entry point: run the TUI in a single-threaded Tokio runtime.
 ///
 /// # Errors
-/// Returns an error if the terminal cannot be initialised or the daemon is unreachable.
+/// Returns an error if the terminal cannot be initialised or drawn to.
 pub fn run(socket_path: PathBuf) -> Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -45,19 +51,18 @@ pub fn run(socket_path: PathBuf) -> Result<()> {
 }
 
 async fn run_async(socket_path: PathBuf) -> Result<()> {
-    let config = crate::config::load().unwrap_or_default();
-    let mut app = App::new(config.defaults.volume);
+    let config = crate::config::load().unwrap_or_else(|e| {
+        tracing::warn!("using default config: {e:#}");
+        crate::config::Config::default()
+    });
+    let mut app = App::new(config.defaults.preset);
+    let mut client = DaemonClient::new(socket_path);
+    sync_from_daemon(&mut app, &mut client).await;
 
-    let client = DaemonClient::connect(socket_path.clone()).await?;
-
-    // Sync EQ state from daemon (best-effort; ignore errors).
-    if let Ok(gains) = client.get_eq().await {
-        app.eq_gains = gains;
-    }
-
-    // Spawn a blocking thread that feeds crossterm events into a channel.
+    // Feed crossterm events into a channel from a detached OS thread. Not
+    // spawn_blocking: the runtime's shutdown would wait for this endless loop.
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<Event>(64);
-    tokio::task::spawn_blocking(move || loop {
+    std::thread::spawn(move || loop {
         match crossterm::event::poll(Duration::from_millis(50)) {
             Ok(true) => match crossterm::event::read() {
                 Ok(event) => {
@@ -87,13 +92,12 @@ async fn run_async(socket_path: PathBuf) -> Result<()> {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
+                    sync_from_daemon(&mut app, &mut client).await;
                     terminal.draw(|f| render(f, &app))?;
                 }
                 event = ev_rx.recv() => {
                     match event {
-                        Some(Event::Key(key)) => {
-                            handle_key(&mut app, &client, key).await?;
-                        }
+                        Some(Event::Key(key)) => handle_key(&mut app, &mut client, key).await,
                         Some(_) => {}
                         None => break,
                     }
@@ -115,95 +119,99 @@ async fn run_async(socket_path: PathBuf) -> Result<()> {
     run_result
 }
 
+/// Copies the daemon's playback state and EQ gains into `app`, or marks it disconnected.
+async fn sync_from_daemon(app: &mut App, client: &mut DaemonClient) {
+    let synced =
+        async { Ok::<_, anyhow::Error>((client.status().await?, client.get_eq().await?)) }.await;
+    match synced {
+        Ok((status, eq_gains)) => {
+            app.connected = true;
+            app.active_preset = status.preset;
+            app.play_state = status.play_state;
+            app.volume = status.volume;
+            app.device_available = status.device_available;
+            app.eq_gains = eq_gains;
+        }
+        Err(_) => app.connected = false,
+    }
+}
+
 // ── Key handling ──────────────────────────────────────────────────────────────
 
-async fn handle_key(app: &mut App, client: &DaemonClient, key: KeyEvent) -> Result<()> {
+/// Applies a key press. Request errors are ignored: the next tick's sync shows
+/// the daemon's real state, or that the connection is lost.
+async fn handle_key(app: &mut App, client: &mut DaemonClient, key: KeyEvent) {
     if key.kind != KeyEventKind::Press {
-        return Ok(());
+        return;
     }
-    match app.screen {
-        Screen::Presets => match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                if app.selected_preset > 0 {
-                    app.selected_preset -= 1;
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if app.selected_preset + 1 < app.preset_list.len() {
-                    app.selected_preset += 1;
-                }
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                let preset = app.preset_list[app.selected_preset];
-                client.send_command(&format!("PLAY {preset}")).await?;
+    match (app.screen, key.code) {
+        (_, KeyCode::Char('q')) => app.should_quit = true,
+        (_, KeyCode::Char('Q')) => {
+            let _ = client.quit_daemon().await;
+            app.should_quit = true;
+        }
+        (Screen::Presets, KeyCode::Up | KeyCode::Char('k')) => {
+            app.selected_preset = app.selected_preset.saturating_sub(1);
+        }
+        (Screen::Presets, KeyCode::Down | KeyCode::Char('j')) => {
+            app.selected_preset = (app.selected_preset + 1).min(NoisePreset::ALL.len() - 1);
+        }
+        (Screen::Presets, KeyCode::Enter | KeyCode::Char(' ')) => {
+            let preset = NoisePreset::ALL[app.selected_preset];
+            if client.play(preset).await.is_ok() {
                 app.active_preset = Some(preset);
                 app.play_state = PlayState::Running;
-                app.screen = Screen::Equalizer;
             }
-            KeyCode::Char('q' | 'Q') => {
-                app.should_quit = true;
+            app.screen = Screen::Equalizer;
+        }
+        (Screen::Presets, KeyCode::Char('e') | KeyCode::Tab) => app.screen = Screen::Equalizer,
+        (Screen::Equalizer, KeyCode::Left | KeyCode::Char('h')) => {
+            app.selected_eq_band = app.selected_eq_band.saturating_sub(1);
+        }
+        (Screen::Equalizer, KeyCode::Right | KeyCode::Char('l')) => {
+            app.selected_eq_band = (app.selected_eq_band + 1).min(N_BANDS - 1);
+        }
+        (Screen::Equalizer, KeyCode::Up | KeyCode::Char('k')) => {
+            let band = app.selected_eq_band;
+            app.eq_gains[band] = (app.eq_gains[band] + 1.0).clamp(GAIN_MIN, GAIN_MAX);
+            let _ = client.set_eq_band(band, app.eq_gains[band]).await;
+        }
+        (Screen::Equalizer, KeyCode::Down | KeyCode::Char('j')) => {
+            let band = app.selected_eq_band;
+            app.eq_gains[band] = (app.eq_gains[band] - 1.0).clamp(GAIN_MIN, GAIN_MAX);
+            let _ = client.set_eq_band(band, app.eq_gains[band]).await;
+        }
+        (Screen::Equalizer, KeyCode::Char('r')) => {
+            app.eq_gains = [0.0; N_BANDS];
+            for band in 0..N_BANDS {
+                let _ = client.set_eq_band(band, 0.0).await;
             }
-            _ => {}
-        },
-        Screen::Equalizer => match key.code {
-            KeyCode::Left | KeyCode::Char('h') => {
-                if app.selected_eq_band > 0 {
-                    app.selected_eq_band -= 1;
-                }
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if app.selected_eq_band + 1 < N_BANDS {
-                    app.selected_eq_band += 1;
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                let band = app.selected_eq_band;
-                app.eq_gains[band] = (app.eq_gains[band] + 1.0).clamp(GAIN_MIN, GAIN_MAX);
-                client.set_eq_band(band, app.eq_gains[band]).await?;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let band = app.selected_eq_band;
-                app.eq_gains[band] = (app.eq_gains[band] - 1.0).clamp(GAIN_MIN, GAIN_MAX);
-                client.set_eq_band(band, app.eq_gains[band]).await?;
-            }
-            KeyCode::Char('r') => {
-                app.eq_gains = [0.0f32; N_BANDS];
-                for band in 0..N_BANDS {
-                    client.set_eq_band(band, 0.0).await?;
-                }
-            }
-            KeyCode::Char('s') => {
-                if app.play_state == PlayState::Running {
-                    client.send_command("STOP").await?;
+        }
+        (Screen::Equalizer, KeyCode::Char('s')) => {
+            if app.play_state == PlayState::Running {
+                if client.stop().await.is_ok() {
                     app.play_state = PlayState::Stopped;
-                } else if let Some(preset) = app.active_preset {
-                    let cmd = format!("PLAY {preset}");
-                    client.send_command(&cmd).await?;
+                }
+            } else if let Some(preset) = app.active_preset {
+                if client.play(preset).await.is_ok() {
                     app.play_state = PlayState::Running;
                 }
             }
-            KeyCode::Tab | KeyCode::Char('p') | KeyCode::Esc | KeyCode::Backspace => {
-                app.screen = Screen::Presets;
-            }
-            KeyCode::Char('[') => {
-                app.volume = (app.volume - 0.05).clamp(0.0, 1.0);
-                client
-                    .send_fire_and_forget(&format!("SET_VOLUME {:.2}", app.volume))
-                    .await?;
-            }
-            KeyCode::Char(']') => {
-                app.volume = (app.volume + 0.05).clamp(0.0, 1.0);
-                client
-                    .send_fire_and_forget(&format!("SET_VOLUME {:.2}", app.volume))
-                    .await?;
-            }
-            KeyCode::Char('q' | 'Q') => {
-                app.should_quit = true;
-            }
-            _ => {}
-        },
+        }
+        (Screen::Equalizer, KeyCode::Char('[')) => {
+            app.volume = (app.volume - VOLUME_STEP).clamp(0.0, 1.0);
+            let _ = client.set_volume(app.volume).await;
+        }
+        (Screen::Equalizer, KeyCode::Char(']')) => {
+            app.volume = (app.volume + VOLUME_STEP).clamp(0.0, 1.0);
+            let _ = client.set_volume(app.volume).await;
+        }
+        (
+            Screen::Equalizer,
+            KeyCode::Tab | KeyCode::Char('p') | KeyCode::Esc | KeyCode::Backspace,
+        ) => app.screen = Screen::Presets,
+        _ => {}
     }
-    Ok(())
 }
 
 // ── Layout helpers ─────────────────────────────────────────────────────────────
@@ -230,7 +238,12 @@ fn render_dither_margins(frame: &mut ratatui::Frame, full: Rect, outer: Rect) {
     if outer.bottom() < full.bottom() {
         frame.render_widget(
             art::DitherBackground,
-            Rect::new(full.x, outer.bottom(), full.width, full.bottom() - outer.bottom()),
+            Rect::new(
+                full.x,
+                outer.bottom(),
+                full.width,
+                full.bottom() - outer.bottom(),
+            ),
         );
     }
     // Left strip (rows alongside outer only)
@@ -244,7 +257,12 @@ fn render_dither_margins(frame: &mut ratatui::Frame, full: Rect, outer: Rect) {
     if outer.right() < full.right() {
         frame.render_widget(
             art::DitherBackground,
-            Rect::new(outer.right(), outer.y, full.right() - outer.right(), outer.height),
+            Rect::new(
+                outer.right(),
+                outer.y,
+                full.right() - outer.right(),
+                outer.height,
+            ),
         );
     }
 }
@@ -260,10 +278,10 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(outer_block, outer);
 
     let zones = Layout::vertical([
-        Constraint::Length(3),   // title bar
-        Constraint::Length(16),  // content
-        Constraint::Length(2),   // footer
-        Constraint::Length(1),   // status bar
+        Constraint::Length(3),  // title bar
+        Constraint::Length(16), // content
+        Constraint::Length(2),  // footer
+        Constraint::Length(1),  // status bar
     ])
     .split(inner);
 
@@ -271,30 +289,44 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     render_status_bar(frame, app, zones[3]);
 
     match app.screen {
-        Screen::Presets   => { render_presets(frame, app, zones[1]); render_footer_presets(frame, zones[2]); }
-        Screen::Equalizer => { render_eq(frame, app, zones[1]);      render_footer_eq(frame, zones[2]); }
+        Screen::Presets => {
+            render_presets(frame, app, zones[1]);
+            render_footer_presets(frame, zones[2]);
+        }
+        Screen::Equalizer => {
+            render_eq(frame, app, zones[1]);
+            render_footer_eq(frame, zones[2]);
+        }
     }
 }
 
 fn render_title_bar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let dot_color = if app.play_state == PlayState::Running { PLAYING_DOT_FG } else { STOPPED_DOT_FG };
-    let status_dot = if app.play_state == PlayState::Running { "●" } else { "○" };
-    let preset_name = app.active_preset.map_or("—", |p| match p {
-        NoisePreset::White => "White",
-        NoisePreset::Pink => "Pink",
-        NoisePreset::Brown => "Brown",
-    });
+    let playing = app.play_state == PlayState::Running;
+    let dot_color = if playing {
+        PLAYING_DOT_FG
+    } else {
+        STOPPED_DOT_FG
+    };
+    let status_dot = if playing { "●" } else { "○" };
+    let preset_name = app.active_preset.map_or("—", NoisePreset::label);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let vol_pct = (app.volume * 100.0).clamp(0.0, 100.0) as u8;
+    // clamped to 0–100, so the cast is exact
+    let vol_pct = (app.volume * 100.0).round().clamp(0.0, 100.0) as u8;
     let screen_name = match app.screen {
         Screen::Presets => "presets",
         Screen::Equalizer => "equalizer",
     };
 
     let title_line = Line::from(vec![
-        Span::styled(art::LOGO_LINE, Style::default().fg(TITLE_FG).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            art::LOGO_LINE,
+            Style::default().fg(TITLE_FG).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(status_dot, Style::default().fg(dot_color)),
-        Span::styled(format!(" {preset_name}  vol: {vol_pct}% "), Style::default().fg(TITLE_FG)),
+        Span::styled(
+            format!(" {preset_name}  vol: {vol_pct}% "),
+            Style::default().fg(TITLE_FG),
+        ),
     ]);
     let screen_line = Line::from(Span::styled(
         format!(" {screen_name} "),
@@ -312,9 +344,14 @@ fn render_title_bar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 }
 
 fn render_status_bar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let text = match app.play_state {
-        PlayState::Running => " daemon: connected  playing",
-        PlayState::Stopped => " daemon: connected  stopped",
+    let text = if !app.connected {
+        " daemon: disconnected  reconnecting…"
+    } else if !app.device_available {
+        " daemon: connected  audio device unavailable, retrying…"
+    } else if app.play_state == PlayState::Running {
+        " daemon: connected  playing"
+    } else {
+        " daemon: connected  stopped"
     };
     let para = Paragraph::new(Span::styled(text, Style::default().fg(STATUS_FG)));
     frame.render_widget(para, area);
@@ -322,36 +359,42 @@ fn render_status_bar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
 
 fn render_footer_presets(frame: &mut ratatui::Frame, area: Rect) {
     let para = Paragraph::new(vec![
-        Line::from(Span::styled(" ↑ ↓ / j k  navigate   Enter / Space  play + eq", Style::default().fg(FOOTER_FG))),
-        Line::from(Span::styled(" q  quit", Style::default().fg(FOOTER_FG))),
+        Line::from(Span::styled(
+            " ↑ ↓ / j k  navigate   Enter / Space  play + eq   e / Tab  eq",
+            Style::default().fg(FOOTER_FG),
+        )),
+        Line::from(Span::styled(
+            " q  quit   Q  quit + stop daemon",
+            Style::default().fg(FOOTER_FG),
+        )),
     ]);
     frame.render_widget(para, area);
 }
 
 fn render_footer_eq(frame: &mut ratatui::Frame, area: Rect) {
     let para = Paragraph::new(vec![
-        Line::from(Span::styled(" ← →  band   ↑ ↓  ±1 dB   r  reset   s  play/stop   [ ]  vol", Style::default().fg(FOOTER_FG))),
-        Line::from(Span::styled(" Esc / p / Tab  presets   q  quit", Style::default().fg(FOOTER_FG))),
+        Line::from(Span::styled(
+            " ← →  band   ↑ ↓  ±1 dB   r  reset   s  play/stop   [ ]  vol",
+            Style::default().fg(FOOTER_FG),
+        )),
+        Line::from(Span::styled(
+            " Esc / p / Tab  presets   q  quit   Q  quit + stop daemon",
+            Style::default().fg(FOOTER_FG),
+        )),
     ]);
     frame.render_widget(para, area);
 }
 
 fn render_presets(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .preset_list
+    let items: Vec<ListItem> = NoisePreset::ALL
         .iter()
-        .map(|preset| {
-            let prefix = if app.active_preset == Some(*preset) {
+        .map(|&preset| {
+            let prefix = if app.active_preset == Some(preset) {
                 "▶ "
             } else {
                 "  "
             };
-            let name = match preset {
-                NoisePreset::White => "White Noise",
-                NoisePreset::Pink => "Pink Noise",
-                NoisePreset::Brown => "Brown Noise",
-            };
-            ListItem::new(format!("{prefix}{name}"))
+            ListItem::new(format!("{prefix}{} Noise", preset.label()))
         })
         .collect();
 
@@ -374,38 +417,39 @@ fn render_presets(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
+/// Bar height for an EQ gain: `GAIN_MIN` maps to 0 and `GAIN_MAX` to the top.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to 0..=GAIN_MAX-GAIN_MIN, so the cast is exact
+fn eq_bar_height(gain_db: f32) -> u64 {
+    (gain_db.clamp(GAIN_MIN, GAIN_MAX) - GAIN_MIN).round() as u64
+}
+
+/// Gain readout: "0" when within half a dB of flat, else signed whole dB.
+fn format_gain(gain_db: f32) -> String {
+    if gain_db.abs() < 0.5 {
+        "0".to_owned()
+    } else {
+        format!("{gain_db:+.0}")
+    }
+}
+
 fn render_eq(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     const LABELS: [&str; N_BANDS] = [
         "31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k",
     ];
 
-    let chunks = Layout::vertical([Constraint::Min(0)]).split(area);
-
     let band_freq = BAND_FREQS[app.selected_eq_band];
-    let gain = app.eq_gains[app.selected_eq_band];
-    let gain_str = if gain.abs() < 0.5 {
-        "0 dB".to_owned()
-    } else {
-        format!("{gain:+.0} dB")
-    };
+    let gain = format_gain(app.eq_gains[app.selected_eq_band]);
 
     let bars: Vec<Bar<'static>> = (0..N_BANDS)
         .map(|i| {
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let value = (app.eq_gains[i] + 12.0).clamp(0.0, 24.0) as u64;
-            let text_val = if app.eq_gains[i].abs() < 0.5 {
-                "0".to_owned()
-            } else {
-                format!("{:+.0}", app.eq_gains[i])
-            };
             let fg = if i == app.selected_eq_band {
                 EQ_SELECTED_FG
             } else {
-                Color::Rgb(163, 169, 206)
+                EQ_BAR_FG
             };
             Bar::default()
-                .value(value)
-                .text_value(text_val)
+                .value(eq_bar_height(app.eq_gains[i]))
+                .text_value(format_gain(app.eq_gains[i]))
                 .label(Line::from(LABELS[i]))
                 .style(Style::default().fg(fg))
         })
@@ -414,13 +458,13 @@ fn render_eq(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let chart = BarChart::default()
         .block(
             Block::default()
-                .title(format!(" Equalizer — {band_freq:.0} Hz  {gain_str} "))
+                .title(format!(" Equalizer — {band_freq:.0} Hz  {gain} dB "))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(INNER_BORDER_FG)),
         )
         .data(BarGroup::default().bars(&bars))
         .bar_width(5)
         .bar_gap(1)
-        .max(24);
-    frame.render_widget(chart, chunks[0]);
+        .max(eq_bar_height(GAIN_MAX));
+    frame.render_widget(chart, area);
 }

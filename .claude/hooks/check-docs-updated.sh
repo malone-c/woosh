@@ -19,7 +19,7 @@ fi
 CHANGED=$(git status --porcelain 2>/dev/null | awk '{print $2}')
 
 # Check whether any source code files changed.
-SOURCE_CHANGED=$(echo "$CHANGED" | grep -E '^src/.*\.(rs|toml)$' || true)
+SOURCE_CHANGED=$(echo "$CHANGED" | grep -E '^(src|tests)/.*\.rs$|^Cargo\.toml$' || true)
 
 if [ -z "$SOURCE_CHANGED" ]; then
   exit 0  # No source changes — docs update not required.

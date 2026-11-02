@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tracing_subscriber::EnvFilter;
 
-/// Returns the woosh data directory (`~/.local/share/woosh/`).
+/// Returns the woosh data directory: `~/Library/Application Support/woosh/` on
+/// macOS, `${XDG_DATA_HOME:-~/.local/share}/woosh/` on Linux.
 ///
 /// # Errors
 /// Returns an error if the system data directory cannot be determined.
@@ -59,8 +61,7 @@ pub fn daemon_is_alive() -> Result<bool> {
     };
     // SAFETY: kill(pid, 0) is a standard liveness check with no side effects.
     let alive = unsafe { libc::kill(pid, 0) } == 0;
-    
-    // If process is dead, clean up stale files
+
     if !alive {
         let _ = fs::remove_file(&path);
         if let Ok(sock_path) = socket_path() {
@@ -70,7 +71,7 @@ pub fn daemon_is_alive() -> Result<bool> {
             let _ = fs::remove_file(ready);
         }
     }
-    
+
     Ok(alive)
 }
 
@@ -78,33 +79,20 @@ pub fn daemon_is_alive() -> Result<bool> {
 ///
 /// # Errors
 /// Returns an error if the file cannot be created or written.
-pub fn write_pid_file(pid_path: &PathBuf) -> Result<()> {
+pub fn write_pid_file(pid_path: &Path) -> Result<()> {
     let mut f = fs::File::create(pid_path)
         .with_context(|| format!("cannot create pid file: {}", pid_path.display()))?;
     writeln!(f, "{}", std::process::id())?;
     Ok(())
 }
 
-/// Removes the PID file (best-effort; ignores errors).
-pub fn remove_pid_file() {
-    if let Ok(path) = pid_path() {
-        let _ = fs::remove_file(path);
-    }
-}
-
-/// Removes the readiness file (best-effort; ignores errors).
-pub fn remove_ready_file() {
-    if let Ok(path) = ready_path() {
-        let _ = fs::remove_file(path);
-    }
-}
-
-/// Forks the process into the background using the `daemonize` crate.
-/// The daemonize crate writes the PID of the child automatically.
+/// Forks the process into the background using the `daemonize` crate, which
+/// writes the child's PID to `pid_path`. The child's stdout and stderr are
+/// appended to the log file.
 ///
 /// # Errors
 /// Returns an error if daemonization fails.
-pub fn maybe_daemonize(pid_path: &PathBuf, log_path: &PathBuf) -> Result<()> {
+pub fn daemonize(pid_path: &Path, log_path: &Path) -> Result<()> {
     let log_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -121,11 +109,12 @@ pub fn maybe_daemonize(pid_path: &PathBuf, log_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Initialises tracing to write to the log file (no ANSI colour codes).
+/// Initialises tracing to append to the log file (no ANSI colour codes), with
+/// verbosity from `RUST_LOG` (default `info`).
 ///
 /// # Errors
 /// Returns an error if the log file cannot be opened.
-pub fn init_logging(log_path: &PathBuf) -> Result<()> {
+pub fn init_logging(log_path: &Path) -> Result<()> {
     let log_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -133,6 +122,9 @@ pub fn init_logging(log_path: &PathBuf) -> Result<()> {
         .with_context(|| format!("cannot open log file: {}", log_path.display()))?;
 
     tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_writer(std::sync::Mutex::new(log_file))
         .with_ansi(false)
         .init();

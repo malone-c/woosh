@@ -10,6 +10,9 @@ pub const EQ_Q: f32 = std::f32::consts::SQRT_2;
 pub const GAIN_MIN: f32 = -12.0;
 pub const GAIN_MAX: f32 = 12.0;
 
+/// EQ gains shared between the audio thread and the `EqProcessor` reading them.
+pub type SharedGains = Arc<Mutex<[f32; N_BANDS]>>;
+
 /// Biquad filter coefficients for a peaking EQ band.
 #[derive(Clone, Copy)]
 pub struct BiquadCoeffs {
@@ -52,6 +55,7 @@ pub fn peaking_coeffs(freq: f32, q: f32, gain_db: f32, sample_rate: u32) -> Biqu
     }
 
     #[allow(clippy::cast_precision_loss)]
+    // audio sample rates are far below 2^24, so f32 holds them exactly
     let sr = sample_rate as f32;
     let a = 10.0_f32.powf(gain_db / 40.0);
     let w0 = 2.0 * std::f32::consts::PI * freq / sr;
@@ -82,12 +86,12 @@ pub fn apply_biquad(coeffs: &BiquadCoeffs, state: &mut BiquadState, x: f32) -> f
 
 /// Wraps a `rodio::Source` and applies a 10-band peaking EQ in series.
 ///
-/// Gains are shared via `Arc<Mutex<[f32; N_BANDS]>>` so the audio thread can
-/// update them without re-creating the sink. Coefficients are refreshed every
-/// 512 samples using `try_lock` (same pattern as `sample_buf`).
+/// Gains are shared so the audio thread can update them without re-creating
+/// the sink. Coefficients are refreshed every 512 samples using `try_lock`, so
+/// the audio callback never blocks.
 pub struct EqProcessor<S> {
     inner: S,
-    eq_gains: Arc<Mutex<[f32; N_BANDS]>>,
+    eq_gains: SharedGains,
     cached_gains: [f32; N_BANDS],
     coeffs: [BiquadCoeffs; N_BANDS],
     states: [BiquadState; N_BANDS],
@@ -96,7 +100,7 @@ pub struct EqProcessor<S> {
 }
 
 impl<S: Source<Item = f32>> EqProcessor<S> {
-    pub fn new(inner: S, eq_gains: Arc<Mutex<[f32; N_BANDS]>>) -> Self {
+    pub fn new(inner: S, eq_gains: SharedGains) -> Self {
         let sample_rate = inner.sample_rate();
         Self {
             inner,
@@ -119,6 +123,7 @@ impl<S: Source<Item = f32>> EqProcessor<S> {
 
         if let Ok(gains) = self.eq_gains.try_lock() {
             #[allow(clippy::float_cmp)]
+            // exact comparison: any change at all needs new coefficients
             if *gains != self.cached_gains {
                 self.cached_gains = *gains;
                 for (i, &freq) in BAND_FREQS.iter().enumerate() {

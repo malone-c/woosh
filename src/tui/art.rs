@@ -5,10 +5,10 @@ use ratatui::{
     widgets::Widget,
 };
 
-/// Compact single-line "WOOSH" wordmark using box-drawing characters.
-/// Replaces the plain " WOOSH  " span in the title bar.
+/// Single-line "WOOSH" wordmark in fullwidth letters, shown in the title bar.
 pub const LOGO_LINE: &str = " ＷＯＯＳＨ ";
 
+/// Fills its area with a diagonal `░▒` dither pattern; drawn in the margins around the main box.
 pub struct DitherBackground;
 
 const DITHER_FG: Color = Color::Rgb(64, 58, 54);
@@ -23,8 +23,7 @@ impl Widget for DitherBackground {
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
                 // Deterministic diagonal wave pattern — no RNG needed
-                let idx =
-                    (usize::from(x).wrapping_add(usize::from(y).wrapping_mul(3))) % 5;
+                let idx = (usize::from(x).wrapping_add(usize::from(y).wrapping_mul(3))) % 5;
                 if let Some(cell) = buf.cell_mut((x, y)) {
                     cell.set_symbol(DITHER_SYMBOLS[idx]).set_style(style);
                 }

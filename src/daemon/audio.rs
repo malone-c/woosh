@@ -1,30 +1,80 @@
-use crate::daemon::eq::{EqProcessor, N_BANDS};
+use crate::daemon::eq::{EqProcessor, SharedGains, N_BANDS};
 use crate::daemon::mpv::MpvSource;
-use crate::daemon::state::{DaemonState, NoisePreset, PlayState};
+use crate::daemon::state::{self, ChannelId, DaemonState, NoisePreset, PlayState};
 use rand::distributions::{Distribution, Uniform};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
-use rodio::Source;
+use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+/// Sample rate of every source; all sources are mono.
+pub const SAMPLE_RATE: u32 = 44_100;
+/// Fade-in and fade-out length in samples: 1.5 s at `SAMPLE_RATE`.
+const FADE_SAMPLES: f32 = 66_150.0;
+/// How often the audio thread checks for finished sinks while the device is open.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Wait between attempts to open an unavailable audio device.
+const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// Longest time shutdown waits for fade-outs to finish.
+const SHUTDOWN_FADE_LIMIT: Duration = Duration::from_secs(2);
 
 /// Commands sent from the IPC server to the audio thread.
 #[derive(Debug)]
 pub enum AudioCommand {
     Play(NoisePreset),
-    Stop,
-    SetVolume(f32),
-    SetEq([f32; N_BANDS]),
     PlayPlace(String),
-    StopPlace,
-    SetPlaceVolume(f32),
-    SetPlaceEq([f32; N_BANDS]),
+    /// Fade the channel out.
+    Stop(ChannelId),
+    SetVolume(ChannelId, f32),
+    SetEq(ChannelId, [f32; N_BANDS]),
+    /// Fade out both channels, then end the audio thread.
     Shutdown,
 }
 
-/// Per-preset state for the IIR noise generators.
+/// Gain envelope: fades in from silence, and fades out once the shared flag is set.
+///
+/// Counters are `f32` so the gain arithmetic needs no casts.
+pub struct Fade {
+    in_samples: f32,
+    out_samples: f32,
+    out_requested: Arc<AtomicBool>,
+}
+
+impl Fade {
+    #[must_use]
+    pub fn new(fade_out: Arc<AtomicBool>) -> Self {
+        Self {
+            in_samples: 0.0,
+            out_samples: 0.0,
+            out_requested: fade_out,
+        }
+    }
+
+    /// Returns the gain for the next sample, or `None` once the fade-out has finished.
+    pub fn next_gain(&mut self) -> Option<f32> {
+        let fade_in = self.in_samples / FADE_SAMPLES;
+        self.in_samples = (self.in_samples + 1.0).min(FADE_SAMPLES);
+        if !self.is_fading_out() {
+            return Some(fade_in);
+        }
+        let fade_out = 1.0 - self.out_samples / FADE_SAMPLES;
+        if fade_out <= 0.0 {
+            return None;
+        }
+        self.out_samples += 1.0;
+        Some(fade_in * fade_out)
+    }
+
+    #[must_use]
+    pub fn is_fading_out(&self) -> bool {
+        self.out_requested.load(Ordering::Acquire)
+    }
+}
+
+/// Per-preset state for the noise generators.
 enum NoiseAlgorithm {
     White,
     /// Paul Kellet refined 7-state-variable IIR pink noise filter.
@@ -37,76 +87,27 @@ enum NoiseAlgorithm {
     },
 }
 
-/// A noise source implementing `rodio::Source` that supports white, pink, and brown noise.
-///
-/// Samples are accumulated locally and flushed in batches of 512 into `sample_buf`
-/// (when provided) so the visualizer TUI can read them.
+/// Endless mono noise for one preset, scaled so every preset is about 0.1 RMS.
 pub struct NoiseSource {
     rng: SmallRng,
-    volume: f32,
     dist: Uniform<f32>,
     algorithm: NoiseAlgorithm,
-    /// Accumulator before flushing to `sample_buf`.
-    local_batch: Vec<f32>,
-    /// Shared buffer read by the IPC broadcast task.
-    sample_buf: Option<Arc<Mutex<Vec<f32>>>>,
-    /// Counter for 1.5 s fade-in (0.0 → `66_150.0` samples at `44_100` Hz).
-    /// Stored as `f32` (not `u32`) so arithmetic stays in one type and avoids
-    /// `cast_precision_loss` lints — the counter never exceeds `66_150` so there
-    /// is no precision difference in practice.
-    fade_samples: f32,
-    /// Shared flag; set to `true` by the audio thread to trigger fade-out.
-    fade_out: Arc<AtomicBool>,
-    /// Counter for 1.5 s fade-out (0.0 → `66_150.0` samples at `44_100` Hz).
-    /// Same rationale as `fade_samples`.
-    fade_out_samples: f32,
+    fade: Fade,
 }
 
 impl NoiseSource {
-    /// Creates a new `NoiseSource`.
-    ///
-    /// # Panics
-    /// Panics if the system RNG cannot be seeded.
     #[must_use]
-    pub fn new(
-        preset: NoisePreset,
-        volume: f32,
-        sample_buf: Option<Arc<Mutex<Vec<f32>>>>,
-        fade_out: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(preset: NoisePreset, fade_out: Arc<AtomicBool>) -> Self {
         let algorithm = match preset {
             NoisePreset::White => NoiseAlgorithm::White,
             NoisePreset::Pink => NoiseAlgorithm::Pink { b: [0.0; 7] },
             NoisePreset::Brown => NoiseAlgorithm::Brown { last: 0.0 },
         };
         Self {
-            rng: SmallRng::from_rng(rand::thread_rng()).expect("rng init"),
-            volume,
+            rng: SmallRng::from_entropy(),
             dist: Uniform::new_inclusive(-1.0_f32, 1.0_f32),
             algorithm,
-            local_batch: Vec::with_capacity(512),
-            sample_buf,
-            fade_samples: 0.0,
-            fade_out,
-            fade_out_samples: 0.0,
-        }
-    }
-
-    /// Sets the volume of this source.
-    pub fn set_volume(&mut self, volume: f32) {
-        self.volume = volume;
-    }
-
-    /// Flush `local_batch` into `sample_buf` using a non-blocking `try_lock`.
-    fn try_flush(&mut self) {
-        if let Some(buf) = &self.sample_buf {
-            if let Ok(mut guard) = buf.try_lock() {
-                guard.extend_from_slice(&self.local_batch);
-                self.local_batch.clear();
-            } else if self.local_batch.len() > 4_096 {
-                // Lock persistently contended; discard to avoid unbounded growth.
-                self.local_batch.clear();
-            }
+            fade: Fade::new(fade_out),
         }
     }
 }
@@ -136,31 +137,7 @@ impl Iterator for NoiseSource {
             }
         };
 
-        let fade_in = (self.fade_samples / 66_150.0).min(1.0);
-        self.fade_samples = (self.fade_samples + 1.0).min(66_150.0);
-
-        let fade_out = if self.fade_out.load(Ordering::Relaxed) {
-            let t = self.fade_out_samples / 66_150.0;
-            let fo = 1.0 - t;
-            if fo <= 0.0 {
-                return None;
-            }
-            self.fade_out_samples += 1.0;
-            fo
-        } else {
-            1.0
-        };
-
-        let sample = raw * self.volume * fade_in * fade_out;
-
-        if self.sample_buf.is_some() {
-            self.local_batch.push(sample);
-            if self.local_batch.len() >= 512 {
-                self.try_flush();
-            }
-        }
-
-        Some(sample)
+        Some(raw * self.fade.next_gain()?)
     }
 }
 
@@ -172,271 +149,239 @@ impl Source for NoiseSource {
         1
     }
     fn sample_rate(&self) -> u32 {
-        44_100
+        SAMPLE_RATE
     }
     fn total_duration(&self) -> Option<Duration> {
         None
     }
 }
 
-/// Spawns the dedicated audio thread.
+/// A sink playing one source, and the flag that starts that source's fade-out.
+struct Voice {
+    sink: Sink,
+    fade_out: Arc<AtomicBool>,
+}
+
+impl Voice {
+    fn fade_out(&self) {
+        self.fade_out.store(true, Ordering::Release);
+    }
+
+    fn is_finished(&self) -> bool {
+        self.sink.empty()
+    }
+}
+
+/// Builds a source and plays it through `eq_gains` on a new sink.
+fn start_voice<S>(
+    device: &OutputStreamHandle,
+    make_source: impl FnOnce(Arc<AtomicBool>) -> anyhow::Result<S>,
+    eq_gains: &SharedGains,
+    volume: f32,
+) -> anyhow::Result<Voice>
+where
+    S: Source<Item = f32> + Send + 'static,
+{
+    let fade_out = Arc::new(AtomicBool::new(false));
+    let source = make_source(Arc::clone(&fade_out))?;
+    let sink = Sink::try_new(device)?;
+    sink.set_volume(volume);
+    sink.append(EqProcessor::new(source, Arc::clone(eq_gains)));
+    Ok(Voice { sink, fade_out })
+}
+
+/// Spawns the audio thread, which owns the output device and both channels' sinks.
 ///
-/// `rodio::OutputStream` is `!Send`, so this must run on an OS thread,
-/// not a Tokio task. The thread owns the sinks and processes `AudioCommand`s
-/// until `Shutdown` or the channel is closed.
+/// `rodio::OutputStream` is `!Send`, so this must be an OS thread, not a Tokio
+/// task. The device is opened when a channel starts and released once both
+/// channels have stopped and faded out, so Bluetooth headphones can hand off to
+/// other apps while woosh is idle. While the device cannot be opened, the thread
+/// retries every 5 s and sets `device_available` to false.
 ///
-/// The `OutputStream` is opened lazily on the first `Play`/`PlayPlace` command
-/// and released (dropping the device claim) once both channels are stopped and
-/// their fade-outs have drained. This allows Bluetooth headphones to hand off
-/// to other audio sources while woosh is idle.
-#[allow(clippy::too_many_lines)]
+/// The thread records the outcome of each command in `state` (channel started,
+/// failed, stopped, or place stream ended) and runs until `Shutdown` or until
+/// every sender is dropped.
 pub fn spawn_audio_thread(
     state: Arc<Mutex<DaemonState>>,
-    rx: std::sync::mpsc::Receiver<AudioCommand>,
-    sample_buf: Arc<Mutex<Vec<f32>>>,
-    eq_arc: Arc<Mutex<[f32; N_BANDS]>>,
-    place_eq_arc: Arc<Mutex<[f32; N_BANDS]>>,
+    rx: Receiver<AudioCommand>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        // Used to distinguish a recv timeout (poll tick) from a channel close.
-        // Declared first so it precedes all `let` statements (items_after_statements lint).
-        enum Recv {
-            Got(AudioCommand),
-            Timeout,
-            Gone,
+    std::thread::spawn(move || run_audio_thread(&state, &rx))
+}
+
+#[allow(clippy::too_many_lines)] // one loop owning the !Send device; splitting it means threading six locals through helpers
+fn run_audio_thread(state: &Mutex<DaemonState>, rx: &Receiver<AudioCommand>) {
+    let synth_eq: SharedGains = Arc::new(Mutex::new([0.0; N_BANDS]));
+    let place_eq: SharedGains = Arc::new(Mutex::new([0.0; N_BANDS]));
+    // Declared before the voices so it is dropped after them: sinks must be
+    // dropped before the stream that runs their mixer.
+    let mut device: Option<(OutputStream, OutputStreamHandle)> = None;
+    let mut synth: Option<Voice> = None;
+    let mut place: Option<Voice> = None;
+    // Requests waiting for the device to open.
+    let mut pending_synth: Option<NoisePreset> = None;
+    let mut pending_place: Option<String> = None;
+    let mut next_device_attempt = Instant::now();
+
+    loop {
+        let idle = device.is_none() && pending_synth.is_none() && pending_place.is_none();
+        let command = if idle {
+            match rx.recv() {
+                Ok(command) => Some(command),
+                Err(_) => return,
+            }
+        } else {
+            match rx.recv_timeout(POLL_INTERVAL) {
+                Ok(command) => Some(command),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        };
+
+        match command {
+            Some(AudioCommand::Play(preset)) => {
+                synth = None;
+                pending_synth = Some(preset);
+            }
+            Some(AudioCommand::PlayPlace(location)) => {
+                place = None; // kills the old mpv via MpvSource::drop
+                pending_place = Some(location);
+            }
+            Some(AudioCommand::Stop(ChannelId::Synth)) => {
+                pending_synth = None;
+                if let Some(voice) = &synth {
+                    voice.fade_out();
+                }
+                state::lock(state).synth.play_state = PlayState::Stopped;
+            }
+            Some(AudioCommand::Stop(ChannelId::Place)) => {
+                pending_place = None;
+                if let Some(voice) = &place {
+                    voice.fade_out();
+                }
+                let mut s = state::lock(state);
+                s.place.play_state = PlayState::Stopped;
+                s.place_location = None;
+            }
+            Some(AudioCommand::SetVolume(channel, volume)) => {
+                let voice = match channel {
+                    ChannelId::Synth => &synth,
+                    ChannelId::Place => &place,
+                };
+                if let Some(voice) = voice {
+                    voice.sink.set_volume(volume);
+                }
+            }
+            Some(AudioCommand::SetEq(channel, gains)) => {
+                let eq_gains = match channel {
+                    ChannelId::Synth => &synth_eq,
+                    ChannelId::Place => &place_eq,
+                };
+                *eq_gains.lock().unwrap_or_else(PoisonError::into_inner) = gains;
+            }
+            Some(AudioCommand::Shutdown) => {
+                let voices: Vec<&Voice> = synth.iter().chain(place.iter()).collect();
+                for voice in &voices {
+                    voice.fade_out();
+                }
+                let deadline = Instant::now() + SHUTDOWN_FADE_LIMIT;
+                while Instant::now() < deadline && !voices.iter().all(|voice| voice.is_finished()) {
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                return;
+            }
+            None => {}
         }
 
-        // Stream is opened lazily and dropped when both channels go idle.
-        // IMPORTANT: always drop sinks before dropping the stream — the stream
-        // owns the mixer thread that the sinks write into.
-        let mut opt_stream: Option<(rodio::OutputStream, rodio::OutputStreamHandle)> = None;
-        let mut fade_out_flag = Arc::new(AtomicBool::new(false));
-        let mut place_fade_out_flag: Option<Arc<AtomicBool>> = None;
-        let mut synth_sink: Option<rodio::Sink> = None;
-        let mut place_sink: Option<rodio::Sink> = None;
+        // Open the device for waiting requests, at most once per retry interval.
+        let waiting = pending_synth.is_some() || pending_place.is_some();
+        if waiting && device.is_none() && Instant::now() >= next_device_attempt {
+            device = OutputStream::try_default()
+                .map_err(|e| tracing::error!("audio: cannot open output device: {e}"))
+                .ok();
+            if device.is_none() {
+                next_device_attempt = Instant::now() + DEVICE_RETRY_INTERVAL;
+            }
+            state::lock(state).device_available = device.is_some();
+        }
 
-        loop {
-            // While either channel is fading, use recv_timeout so we can poll
-            // for fade completion every 50 ms and release the device once done.
-            let synth_fading = fade_out_flag.load(Ordering::Relaxed)
-                && synth_sink.as_ref().is_some_and(|s| !s.empty());
-            let place_fading = place_fade_out_flag
-                .as_ref()
-                .is_some_and(|f| f.load(Ordering::Relaxed))
-                && place_sink.as_ref().is_some_and(|s| !s.empty());
-
-            let recv = if synth_fading || place_fading {
-                match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(cmd) => Recv::Got(cmd),
-                    Err(RecvTimeoutError::Timeout) => Recv::Timeout,
-                    Err(RecvTimeoutError::Disconnected) => Recv::Gone,
+        if let Some((_, handle)) = &device {
+            if let Some(preset) = pending_synth.take() {
+                let volume = state::lock(state).synth.volume;
+                let make_noise = |fade_out| Ok(NoiseSource::new(preset, fade_out));
+                synth = start_voice(handle, make_noise, &synth_eq, volume)
+                    .map_err(|e| tracing::error!("audio: cannot start {preset} noise: {e:#}"))
+                    .ok();
+                let mut s = state::lock(state);
+                if synth.is_some() {
+                    s.synth.play_state = PlayState::Running;
+                    s.preset = Some(preset);
+                } else {
+                    s.synth.play_state = PlayState::Stopped;
                 }
-            } else {
-                match rx.recv() {
-                    Ok(cmd) => Recv::Got(cmd),
-                    Err(_) => Recv::Gone,
-                }
-            };
-
-            let cmd = match recv {
-                // Channel closed: local variables drop in reverse declaration
-                // order, so synth_sink and place_sink drop before opt_stream.
-                Recv::Gone => break,
-                Recv::Timeout => {
-                    // Check whether fading sinks have finished and clean up.
-                    if synth_sink.as_ref().is_some_and(rodio::Sink::empty) {
-                        synth_sink = None;
-                    }
-                    if place_sink.as_ref().is_some_and(rodio::Sink::empty) {
-                        place_sink = None;
-                        place_fade_out_flag = None;
-                    }
-                    // Release the audio device when both channels are idle.
-                    if synth_sink.is_none() && place_sink.is_none() {
-                        let both_stopped = state.lock().map_or(true, |s| {
-                            s.play_state == PlayState::Stopped
-                                && s.place_state == PlayState::Stopped
-                        });
-                        if both_stopped {
-                            opt_stream = None; // releases CoreAudio / ALSA claim
-                        }
-                    }
-                    continue;
-                }
-                Recv::Got(cmd) => cmd,
-            };
-
-            match cmd {
-                AudioCommand::Play(preset) => {
-                    // Open the audio device lazily on first play.
-                    if opt_stream.is_none() {
-                        match rodio::OutputStream::try_default() {
-                            Ok(pair) => {
-                                opt_stream = Some(pair);
-                            }
-                            Err(e) => {
-                                tracing::error!("audio: failed to open output stream: {e}");
-                                if let Ok(mut s) = state.lock() {
-                                    s.play_state = PlayState::Stopped;
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    let Some((_, handle)) = &opt_stream else {
-                        continue; // unreachable; satisfies the borrow checker
-                    };
-                    synth_sink = None; // drop old sink, abandoning any active fade
-                    fade_out_flag = Arc::new(AtomicBool::new(false));
-                    match rodio::Sink::try_new(handle) {
-                        Ok(new_sink) => {
-                            new_sink.append(EqProcessor::new(
-                                NoiseSource::new(
-                                    preset,
-                                    1.0,
-                                    Some(Arc::clone(&sample_buf)),
-                                    Arc::clone(&fade_out_flag),
-                                ),
-                                Arc::clone(&eq_arc),
-                            ));
-                            let volume = state.lock().map(|s| s.volume).unwrap_or(0.8);
-                            new_sink.set_volume(volume);
-                            synth_sink = Some(new_sink);
-                        }
-                        Err(e) => {
-                            tracing::error!("audio: failed to create synth sink: {e}");
-                        }
-                    }
-                    if let Ok(mut s) = state.lock() {
-                        s.play_state = PlayState::Running;
-                        s.preset = Some(preset);
-                    }
-                }
-                AudioCommand::Stop => {
-                    fade_out_flag.store(true, Ordering::Release);
-                    if let Ok(mut s) = state.lock() {
-                        s.play_state = PlayState::Stopped;
-                    }
-                }
-                AudioCommand::SetVolume(v) => {
-                    let clamped = v.clamp(0.0, 1.0);
-                    if let Some(s) = &synth_sink {
-                        s.set_volume(clamped);
-                    }
-                    if let Ok(mut s) = state.lock() {
-                        s.volume = clamped;
-                    }
-                }
-                AudioCommand::SetEq(gains) => {
-                    if let Ok(mut guard) = eq_arc.lock() {
-                        *guard = gains;
-                    }
-                }
-                AudioCommand::PlayPlace(location) => {
-                    // Open the audio device lazily on first play.
-                    if opt_stream.is_none() {
-                        match rodio::OutputStream::try_default() {
-                            Ok(pair) => {
-                                opt_stream = Some(pair);
-                            }
-                            Err(e) => {
-                                tracing::error!("audio: failed to open output stream: {e}");
-                                if let Ok(mut s) = state.lock() {
-                                    s.place_state = PlayState::Stopped;
-                                    s.place_location = None;
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    let Some((_, handle)) = &opt_stream else {
-                        continue;
-                    };
-                    place_sink = None; // kills old mpv via MpvSource::drop
-                    let flag = Arc::new(AtomicBool::new(false));
-                    match MpvSource::spawn(&location, Arc::clone(&flag)) {
-                        Err(e) => {
-                            tracing::error!("audio: mpv spawn failed for {location:?}: {e}");
-                            if let Ok(mut s) = state.lock() {
-                                s.place_state = PlayState::Stopped;
-                                s.place_location = None;
-                            }
-                        }
-                        Ok(source) => match rodio::Sink::try_new(handle) {
-                            Err(e) => {
-                                tracing::error!("audio: place sink failed: {e}");
-                                if let Ok(mut s) = state.lock() {
-                                    s.place_state = PlayState::Stopped;
-                                }
-                            }
-                            Ok(new_sink) => {
-                                new_sink.append(EqProcessor::new(
-                                    source,
-                                    Arc::clone(&place_eq_arc),
-                                ));
-                                let vol =
-                                    state.lock().map(|s| s.place_volume).unwrap_or(0.4);
-                                new_sink.set_volume(vol);
-                                if let Ok(mut s) = state.lock() {
-                                    s.place_state = PlayState::Running;
-                                    s.place_location = Some(location);
-                                }
-                                place_fade_out_flag = Some(flag);
-                                place_sink = Some(new_sink);
-                            }
-                        },
-                    }
-                }
-                AudioCommand::StopPlace => {
-                    if let Some(ref flag) = place_fade_out_flag {
-                        flag.store(true, Ordering::Release);
-                    }
-                    if let Ok(mut s) = state.lock() {
-                        s.place_state = PlayState::Stopped;
-                        s.place_location = None;
-                    }
-                }
-                AudioCommand::SetPlaceVolume(v) => {
-                    let clamped = v.clamp(0.0, 1.0);
-                    if let Ok(mut s) = state.lock() {
-                        s.place_volume = clamped;
-                    }
-                    if let Some(ref sink) = place_sink {
-                        sink.set_volume(clamped);
-                    }
-                }
-                AudioCommand::SetPlaceEq(gains) => {
-                    if let Ok(mut guard) = place_eq_arc.lock() {
-                        *guard = gains;
-                    }
-                    if let Ok(mut s) = state.lock() {
-                        s.place_eq_gains = gains;
-                    }
-                }
-                AudioCommand::Shutdown => {
-                    // Locals are declared opt_stream → synth_sink → place_sink,
-                    // so Rust drops them in reverse: place_sink → synth_sink →
-                    // opt_stream. Sinks are torn down before the stream's mixer
-                    // thread — the required ordering.
-                    break;
+            }
+            if let Some(location) = pending_place.take() {
+                let volume = state::lock(state).place.volume;
+                let spawn_mpv = |fade_out| MpvSource::spawn(&location, fade_out);
+                place = start_voice(handle, spawn_mpv, &place_eq, volume)
+                    .map_err(|e| tracing::error!("audio: cannot play place {location:?}: {e:#}"))
+                    .ok();
+                let mut s = state::lock(state);
+                if place.is_some() {
+                    s.place.play_state = PlayState::Running;
+                    s.place_location = Some(location);
+                } else {
+                    s.place.play_state = PlayState::Stopped;
+                    s.place_location = None;
                 }
             }
         }
-    })
+
+        // Drop voices whose source has ended: faded out, or the place stream finished.
+        if synth.as_ref().is_some_and(Voice::is_finished) {
+            synth = None;
+        }
+        if place.as_ref().is_some_and(Voice::is_finished) {
+            place = None;
+            let mut s = state::lock(state);
+            if s.place.play_state == PlayState::Running {
+                tracing::info!("audio: place stream ended");
+            }
+            s.place.play_state = PlayState::Stopped;
+            s.place_location = None;
+        }
+
+        // Release the device once nothing plays or waits for it.
+        let nothing_wanted = synth.is_none()
+            && place.is_none()
+            && pending_synth.is_none()
+            && pending_place.is_none();
+        if nothing_wanted {
+            device = None;
+            next_device_attempt = Instant::now();
+            state::lock(state).device_available = true;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn source(preset: NoisePreset) -> NoiseSource {
+        NoiseSource::new(preset, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Advances `src` past its 1.5 s fade-in so it plays at full amplitude.
+    fn skip_fade_in(src: &mut NoiseSource) {
+        for _ in 0..66_150 {
+            src.next().unwrap();
+        }
+    }
 
     #[test]
     fn white_noise_statistics() {
-        let mut src = NoiseSource::new(NoisePreset::White, 1.0, None, Arc::new(AtomicBool::new(false)));
-        // Skip past the 1.5 s fade ramp so statistics reflect full-amplitude noise.
-        for _ in 0..66_150 {
-            let _ = src.next();
-        }
+        let mut src = source(NoisePreset::White);
+        skip_fade_in(&mut src);
         let samples: Vec<f32> = (0..10_000).map(|_| src.next().unwrap()).collect();
         let mean: f32 = samples.iter().sum::<f32>() / 10_000.0;
         let variance: f32 = samples.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / 10_000.0;
@@ -448,11 +393,9 @@ mod tests {
 
     #[test]
     fn pink_noise_in_range() {
-        let mut src = NoiseSource::new(NoisePreset::Pink, 1.0, None, Arc::new(AtomicBool::new(false)));
+        let mut src = source(NoisePreset::Pink);
         let samples: Vec<f32> = (0..44_100).map(|_| src.next().unwrap()).collect();
-        #[allow(clippy::cast_precision_loss)]
-        let mean: f32 = samples.iter().sum::<f32>() / samples.len() as f32;
-        // Pink noise should have zero mean and bounded output
+        let mean: f32 = samples.iter().sum::<f32>() / 44_100.0;
         assert!(mean.abs() < 0.1, "pink mean={mean}");
         assert!(
             samples.iter().all(|&s| (-1.1..=1.1).contains(&s)),
@@ -462,7 +405,7 @@ mod tests {
 
     #[test]
     fn brown_noise_clamped() {
-        let mut src = NoiseSource::new(NoisePreset::Brown, 1.0, None, Arc::new(AtomicBool::new(false)));
+        let mut src = source(NoisePreset::Brown);
         let samples: Vec<f32> = (0..10_000).map(|_| src.next().unwrap()).collect();
         assert!(
             samples.iter().all(|&s| (-1.0..=1.0).contains(&s)),
@@ -473,33 +416,16 @@ mod tests {
     #[test]
     fn noise_source_fade_out() {
         let fade_out = Arc::new(AtomicBool::new(false));
-        let mut src =
-            NoiseSource::new(NoisePreset::White, 1.0, None, Arc::clone(&fade_out));
+        let mut src = NoiseSource::new(NoisePreset::White, Arc::clone(&fade_out));
+        skip_fade_in(&mut src);
 
-        // Skip past the 1.5 s fade-in ramp so the source is at full amplitude.
-        for _ in 0..66_150 {
-            src.next().unwrap();
-        }
-
-        // Trigger fade-out.
         fade_out.store(true, Ordering::Release);
-
-        // Collect every sample until the source terminates.
         let samples: Vec<f32> = std::iter::from_fn(|| src.next()).collect();
 
-        // The ramp runs for exactly 66_150 samples before returning None.
-        assert_eq!(
-            samples.len(),
-            66_150,
-            "expected 66_150 fade-out samples, got {}",
-            samples.len()
-        );
+        assert_eq!(samples.len(), 66_150, "fade-out should last exactly 1.5 s");
 
-        // Envelope should be decreasing: RMS near the start > RMS near the midpoint.
-        let start_rms =
-            (samples[..1_000].iter().map(|s| s * s).sum::<f32>() / 1_000.0).sqrt();
-        let mid_rms =
-            (samples[32_575..33_575].iter().map(|s| s * s).sum::<f32>() / 1_000.0).sqrt();
+        let start_rms = (samples[..1_000].iter().map(|s| s * s).sum::<f32>() / 1_000.0).sqrt();
+        let mid_rms = (samples[32_575..33_575].iter().map(|s| s * s).sum::<f32>() / 1_000.0).sqrt();
         assert!(
             mid_rms < start_rms,
             "fade-out envelope not decreasing: start_rms={start_rms}, mid_rms={mid_rms}"
@@ -507,56 +433,33 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    fn fade_in_ramps_from_silence() {
+        let mut fade = Fade::new(Arc::new(AtomicBool::new(false)));
+        let gains: Vec<f32> = (0..66_151).map(|_| fade.next_gain().unwrap()).collect();
+        assert!(gains[0].abs() < f32::EPSILON);
+        assert!(gains[33_075] > 0.49 && gains[33_075] < 0.51);
+        assert!((gains[66_150] - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    #[ignore = "prints noise levels; run with `cargo test measure_noise_levels -- --ignored --nocapture`"]
     fn measure_noise_levels() {
-        const FADE_IN_SAMPLES: usize = 66_150;
-        const MEASURE_SAMPLES: usize = 44_100;
-
-        struct Metrics {
-            rms: f32,
-            peak: f32,
-            crest: f32,
-        }
-
-        fn measure(preset: NoisePreset) -> Metrics {
-            let mut src = NoiseSource::new(
-                preset,
-                1.0,
-                None,
-                Arc::new(AtomicBool::new(false)),
-            );
-            for _ in 0..FADE_IN_SAMPLES {
-                let _ = src.next();
-            }
-            let samples: Vec<f32> = (0..MEASURE_SAMPLES)
-                .map(|_| src.next().unwrap())
-                .collect();
-            #[allow(clippy::cast_precision_loss)]
-            let mean_sq: f32 =
-                samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32;
-            let rms = mean_sq.sqrt();
-            let peak = samples.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
-            let crest = if rms > 0.0 { peak / rms } else { 0.0 };
-            Metrics { rms, peak, crest }
-        }
-
-        let presets = [
-            ("White", NoisePreset::White),
-            ("Pink", NoisePreset::Pink),
-            ("Brown", NoisePreset::Brown),
-        ];
-
         println!();
         println!(
             "{:<8}  {:>10}  {:>10}  {:>12}",
             "Preset", "RMS", "Peak", "Crest Factor"
         );
         println!("{}", "-".repeat(46));
-        for (name, preset) in presets {
-            let m = measure(preset);
+        for preset in NoisePreset::ALL {
+            let mut src = source(preset);
+            skip_fade_in(&mut src);
+            let samples: Vec<f32> = (0..44_100).map(|_| src.next().unwrap()).collect();
+            let rms = (samples.iter().map(|&s| s * s).sum::<f32>() / 44_100.0).sqrt();
+            let peak = samples.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+            let crest = if rms > 0.0 { peak / rms } else { 0.0 };
             println!(
-                "{:<8}  {:>10.6}  {:>10.6}  {:>12.6}",
-                name, m.rms, m.peak, m.crest
+                "{:<8}  {rms:>10.6}  {peak:>10.6}  {crest:>12.6}",
+                preset.label()
             );
         }
         println!();

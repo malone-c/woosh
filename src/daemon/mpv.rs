@@ -1,114 +1,95 @@
-use std::collections::VecDeque;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rodio::Source;
 
-/// Maximum buffered samples (≈ 5 s at 44 100 Hz mono).
-const MAX_BUFFER_SAMPLES: usize = 220_500;
+use crate::daemon::audio::{Fade, SAMPLE_RATE};
+
+/// Samples per chunk the reader thread hands to the source (≈ 46 ms).
+const CHUNK_SAMPLES: usize = 2_048;
+/// Chunks buffered ahead of playback (≈ 5 s) before the reader thread blocks.
+const MAX_BUFFERED_CHUNKS: usize = 108;
 
 /// Wraps an `mpv` subprocess and exposes its PCM output as a `rodio::Source`.
 ///
-/// `mpv` is instructed to output raw signed-16-bit little-endian mono PCM at
-/// 44 100 Hz to stdout.  A dedicated reader thread converts each `i16` frame
-/// to an `f32` in `[-1.0, 1.0]` and pushes it into a shared `VecDeque`.
+/// `mpv` decodes the first `YouTube` result for "walking through {location}"
+/// that is at least 10 minutes long, skipping its first five minutes, and writes signed 16-bit mono PCM at
+/// `SAMPLE_RATE` to stdout. A reader thread converts it to `f32` chunks and
+/// sends them over a bounded channel. `--ao=pcm` decodes faster than real time,
+/// so the channel fills up; the reader then blocks, mpv blocks on the full
+/// pipe, and playback speed paces the whole pipeline.
 ///
-/// `Iterator::next` is **non-blocking** (called from rodio's audio thread):
-/// it returns `Some(0.0)` (silence) when the buffer is empty but the reader
-/// thread is still alive, and `None` only after the reader thread has exited.
-#[allow(clippy::module_name_repetitions)]
+/// `Iterator::next` never blocks or takes a lock: it returns silence while mpv
+/// is buffering and `None` once mpv's output has been played to the end.
 pub struct MpvSource {
     child: Child,
-    buffer: Arc<Mutex<VecDeque<f32>>>,
-    reader_done: Arc<AtomicBool>,
-    /// Counter for 1.5 s fade-in (0.0 → `66_150.0` samples at `44_100` Hz).
-    /// Stored as `f32` (not `u32`) so arithmetic stays in one type and avoids
-    /// `cast_precision_loss` lints — the counter never exceeds `66_150` so there
-    /// is no precision difference in practice.
-    fade_samples: f32,
-    /// Shared flag; set to `true` by the audio thread to trigger fade-out.
-    fade_out: Arc<AtomicBool>,
-    /// Counter for 1.5 s fade-out (0.0 → `66_150.0` samples at `44_100` Hz).
-    /// Same rationale as `fade_samples`.
-    fade_out_samples: f32,
+    chunks: Receiver<Vec<f32>>,
+    current: std::vec::IntoIter<f32>,
+    fade: Fade,
 }
 
 impl MpvSource {
-    /// Spawn `mpv` and begin streaming PCM for `ytsearch1:walking through {location}`.
+    /// Spawn `mpv` and begin streaming PCM for the first long `YouTube` result for "walking through {location}".
     ///
     /// # Errors
     /// Returns an error if `mpv` cannot be spawned (binary not found, etc.).
-    ///
-    /// # Panics
-    /// Panics if the child process stdout handle cannot be taken (should never happen
-    /// because stdout is set to `Stdio::piped()`).
     pub fn spawn(location: &str, fade_out: Arc<AtomicBool>) -> anyhow::Result<Self> {
-        let query = format!("ytsearch1:walking through {location}");
+        // mpv only passes recognised URLs to yt-dlp; the ytdl:// prefix makes it treat the search as one.
+        let query = format!("ytdl://ytsearch10:walking through {location}");
+        let sample_rate = format!("--audio-samplerate={SAMPLE_RATE}");
 
         let mut child = Command::new("mpv")
             .args([
                 &query,
+                // Only videos of 10+ minutes, so skipping the first five leaves something to play.
+                "--ytdl-raw-options=match-filter=duration>=600",
+                "--start=300",
                 "--no-video",
                 "--no-terminal",
                 "--audio-display=no",
                 "--ytdl-format=bestaudio/best",
-                "--af=aformat=format=s16le:rate=44100:channels=1",
+                "--audio-format=s16",
+                &sample_rate,
+                "--audio-channels=mono",
                 "--ao=pcm",
                 "--ao-pcm-waveheader=no",
                 "--ao-pcm-file=/dev/stdout",
-                "--msg-level=all=no",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
             .spawn()?;
 
-        let buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let reader_done: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let Some(mut stdout) = child.stdout.take() else {
+            anyhow::bail!("mpv stdout was not captured");
+        };
+        let (chunk_tx, chunks) = mpsc::sync_channel(MAX_BUFFERED_CHUNKS);
 
-        let mut stdout = child.stdout.take().expect("stdout was piped");
-        let buffer_clone = Arc::clone(&buffer);
-        let done_clone = Arc::clone(&reader_done);
-
-        // Reader thread: convert raw s16le PCM → f32 and push into shared buffer.
-        // The JoinHandle is intentionally dropped so this thread runs detached.
+        // The JoinHandle is dropped so the reader runs detached. It ends when mpv
+        // exits (killed in Drop), or when sending fails because the source was dropped.
         std::thread::spawn(move || {
-            let mut raw = [0u8; 1024];
-            loop {
-                match stdout.read(&mut raw) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let samples: Vec<f32> = raw[..n]
-                            .chunks_exact(2)
-                            .map(|b| {
-                                let s = i16::from_le_bytes([b[0], b[1]]);
-                                f32::from(s) / 32_768.0_f32
-                            })
-                            .collect();
-
-                        if let Ok(mut guard) = buffer_clone.lock() {
-                            guard.extend(samples);
-                            // Cap at ~5 seconds to bound memory.
-                            while guard.len() > MAX_BUFFER_SAMPLES {
-                                guard.pop_front();
-                            }
-                        }
-                    }
+            let mut bytes = [0u8; CHUNK_SAMPLES * 2];
+            // read_exact keeps whole 2-byte samples; a partial chunk at end of stream is dropped.
+            while stdout.read_exact(&mut bytes).is_ok() {
+                let chunk = bytes
+                    .chunks_exact(2)
+                    .map(|pair| f32::from(i16::from_le_bytes([pair[0], pair[1]])) / 32_768.0)
+                    .collect();
+                if chunk_tx.send(chunk).is_err() {
+                    return;
                 }
             }
-            done_clone.store(true, Ordering::Release);
         });
 
         Ok(Self {
             child,
-            buffer,
-            reader_done,
-            fade_samples: 0.0,
-            fade_out,
-            fade_out_samples: 0.0,
+            chunks,
+            current: Vec::new().into_iter(),
+            fade: Fade::new(fade_out),
         })
     }
 }
@@ -116,40 +97,20 @@ impl MpvSource {
 impl Iterator for MpvSource {
     type Item = f32;
 
-    /// Non-blocking: returns silence while mpv is still buffering, `None` only after exit.
     fn next(&mut self) -> Option<f32> {
-        let raw = if let Ok(mut guard) = self.buffer.try_lock() {
-            if let Some(sample) = guard.pop_front() {
-                sample
-            } else {
-                if self.reader_done.load(Ordering::Acquire) {
-                    return None;
-                }
-                // Silence while mpv hasn't produced data yet.
-                0.0
+        loop {
+            if let Some(sample) = self.current.next() {
+                return Some(sample * self.fade.next_gain()?);
             }
-        } else {
-            if self.reader_done.load(Ordering::Acquire) {
-                return None;
+            match self.chunks.try_recv() {
+                Ok(chunk) => self.current = chunk.into_iter(),
+                // The reader has finished and every chunk has been played.
+                Err(TryRecvError::Disconnected) => return None,
+                Err(TryRecvError::Empty) if self.fade.is_fading_out() => return None,
+                // Silence while mpv is buffering; the fade-in only advances on real audio.
+                Err(TryRecvError::Empty) => return Some(0.0),
             }
-            0.0
-        };
-        let fade_in = (self.fade_samples / 66_150.0).min(1.0);
-        self.fade_samples = (self.fade_samples + 1.0).min(66_150.0);
-
-        let fade_out = if self.fade_out.load(Ordering::Relaxed) {
-            let t = self.fade_out_samples / 66_150.0;
-            let fo = 1.0 - t;
-            if fo <= 0.0 {
-                return None;
-            }
-            self.fade_out_samples += 1.0;
-            fo
-        } else {
-            1.0
-        };
-
-        Some(raw * fade_in * fade_out)
+        }
     }
 }
 
@@ -161,7 +122,7 @@ impl Source for MpvSource {
         1
     }
     fn sample_rate(&self) -> u32 {
-        44_100
+        SAMPLE_RATE
     }
     fn total_duration(&self) -> Option<Duration> {
         None

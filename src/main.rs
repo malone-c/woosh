@@ -2,19 +2,21 @@
 //!
 //! - `woosh`                   — launch TUI (spawns daemon if needed)
 //! - `woosh pink|white|brown`  — play noise preset and exit
-//! - `woosh place <name>`      — play place sound by name and exit
+//! - `woosh <place>`           — play a place sound (e.g. `woosh tokyo`) and exit
+//! - `woosh place <name>`      — same, for names that match a subcommand
 //! - `woosh daemon`            — start audio daemon in the background
 //! - `woosh stop`              — send QUIT to the running daemon
 //! - `woosh status`            — print daemon state and exit
 
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 use woosh::daemon;
+use woosh::daemon::state::NoisePreset;
 
 /// A terminal white noise generator.
 #[derive(Debug, Parser)]
@@ -43,63 +45,76 @@ enum Commands {
     White,
     /// Play brown noise and exit.
     Brown,
-    /// Play a place sound by name and exit (e.g. `woosh place tokyo` or `woosh place coffee shop`).
+    /// Play a place sound by name and exit (e.g. `woosh place coffee shop`).
     Place {
         /// Place name — multi-word names work without quotes.
         #[arg(trailing_var_arg = true, required = true)]
         name: Vec<String>,
     },
+    /// Any other words name a place sound to play, e.g. `woosh tokyo`.
+    #[command(external_subcommand)]
+    PlaceShortcut(Vec<String>),
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging with RUST_LOG env var (default: info)
-    // Skip for daemon subcommand as it initializes its own file-based logging
+    // The daemon logs to its own file; everything else logs to stderr (RUST_LOG, default info).
     if !matches!(cli.command, Some(Commands::Daemon { .. })) {
         tracing_subscriber::fmt()
             .with_env_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("info"))
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
             )
+            .with_writer(std::io::stderr)
             .init();
     }
 
     match cli.command {
-        Some(Commands::Daemon { no_daemonize }) => run_daemon(no_daemonize),
+        Some(Commands::Daemon { no_daemonize }) => daemon::start(no_daemonize),
         Some(Commands::Stop) => run_stop(),
-        Some(Commands::Status) => run_status(),
-        Some(Commands::Pink) => run_play_preset("pink"),
-        Some(Commands::White) => run_play_preset("white"),
-        Some(Commands::Brown) => run_play_preset("brown"),
-        Some(Commands::Place { name }) => run_play_place(&name.join(" ")),
+        Some(Commands::Status) => {
+            print!("{}", request("STATUS")?);
+            Ok(())
+        }
+        Some(Commands::Pink) => play(&format!("PLAY {}", NoisePreset::Pink)),
+        Some(Commands::White) => play(&format!("PLAY {}", NoisePreset::White)),
+        Some(Commands::Brown) => play(&format!("PLAY {}", NoisePreset::Brown)),
+        Some(Commands::Place { name } | Commands::PlaceShortcut(name)) => {
+            play(&format!("PLAY_PLACE {}", name.join(" ")))
+        }
         None => run_tui(),
     }
 }
 
-/// Start audio daemon (daemonizes unless `--no-daemonize`).
-fn run_daemon(no_daemonize: bool) -> Result<()> {
-    daemon::start(no_daemonize)
+/// Connects to the running daemon's socket.
+fn connect() -> Result<UnixStream> {
+    let socket_path = daemon::lifecycle::socket_path()?;
+    UnixStream::connect(&socket_path)
+        .map_err(|_| anyhow!("daemon is not running (cannot connect to socket)"))
 }
 
-/// Stop the running daemon by sending QUIT over the Unix socket.
+/// Stop the running daemon by sending QUIT, which has no reply.
 fn run_stop() -> Result<()> {
-    let socket_path = daemon::lifecycle::socket_path()?;
-    let mut stream = UnixStream::connect(&socket_path)
-        .map_err(|_| anyhow!("daemon is not running (cannot connect to socket)"))?;
-    stream.write_all(b"QUIT\n")?;
+    connect()?.write_all(b"QUIT\n")?;
     Ok(())
 }
 
-/// Query daemon status and print to stdout.
-fn run_status() -> Result<()> {
-    let socket_path = daemon::lifecycle::socket_path()?;
-    let mut stream = UnixStream::connect(&socket_path)
-        .map_err(|_| anyhow!("daemon is not running (cannot connect to socket)"))?;
-    stream.write_all(b"STATUS\n")?;
-    let mut buf = String::new();
-    stream.read_to_string(&mut buf)?;
-    print!("{buf}");
+/// Sends one command to the daemon and returns its one-line reply.
+fn request(command: &str) -> Result<String> {
+    let mut stream = connect()?;
+    stream.write_all(format!("{command}\n").as_bytes())?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply)?;
+    Ok(reply)
+}
+
+/// Spawns the daemon if needed, sends a play command, and fails if the daemon rejects it.
+fn play(command: &str) -> Result<()> {
+    ensure_daemon_running()?;
+    let reply = request(command)?;
+    if let Some(message) = reply.strip_prefix("ERROR ") {
+        bail!("{}", message.trim());
+    }
     Ok(())
 }
 
@@ -126,26 +141,6 @@ fn ensure_daemon_running() -> Result<()> {
             sleep(Duration::from_millis(10));
         }
     }
-    Ok(())
-}
-
-/// Send `PLAY <preset>` to the daemon, spawning it first if needed.
-fn run_play_preset(preset: &str) -> Result<()> {
-    ensure_daemon_running()?;
-    let socket_path = daemon::lifecycle::socket_path()?;
-    let mut stream = UnixStream::connect(&socket_path)
-        .map_err(|_| anyhow!("daemon is not running"))?;
-    stream.write_all(format!("PLAY {preset}\n").as_bytes())?;
-    Ok(())
-}
-
-/// Send `PLAY_PLACE <location>` to the daemon, spawning it first if needed.
-fn run_play_place(location: &str) -> Result<()> {
-    ensure_daemon_running()?;
-    let socket_path = daemon::lifecycle::socket_path()?;
-    let mut stream = UnixStream::connect(&socket_path)
-        .map_err(|_| anyhow!("daemon is not running"))?;
-    stream.write_all(format!("PLAY_PLACE {location}\n").as_bytes())?;
     Ok(())
 }
 

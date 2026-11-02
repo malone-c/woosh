@@ -40,7 +40,7 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 - [x] Implement `NoiseSource` struct with `Iterator<Item = f32>` and `rodio::Source` trait
 - [x] White noise: uniform random samples from `SmallRng` (seeded via `rand::thread_rng()`)
 - [x] Per-sample volume scaling via `self.volume`
-- [x] Unit test: 10 000 sample sequence has mean ≈ 0 and std dev ≈ 0.577 (uniform [-1, 1])
+- [x] Unit test: 10 000 sample sequence has mean ≈ 0 and std dev ≈ 0.577 (uniform [-1, 1]; ≈ 0.0996 since the 3.5.14 normalisation)
 
 #### 1.2 — Audio output
 
@@ -50,18 +50,18 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 #### 1.3 — Daemonize & PID
 
-- [x] `daemonize` crate: double-fork, redirect stdio to `/dev/null`, write PID file
-- [x] XDG-aware paths via `dirs::data_dir()` → `~/.local/share/woosh/`
+- [x] `daemonize` crate: double-fork, stdout/stderr appended to `woosh.log`, write PID file
+- [x] Paths via `dirs::data_dir()` → `~/Library/Application Support/woosh/` (macOS), `~/.local/share/woosh/` (Linux)
 - [x] On startup, check for stale PID file (process dead); overwrite if stale
-- [x] `tracing` logs to `~/.local/share/woosh/woosh.log`
+- [x] `tracing` logs to `woosh.log` in the data directory
 
 #### 1.4 — IPC server
 
-- [x] `tokio::net::UnixListener` on `~/.local/share/woosh/woosh.sock`
+- [x] `tokio::net::UnixListener` on `woosh.sock` in the data directory
 - [x] Spawn a task per connection; read lines, dispatch commands
 - [x] Handle: `PLAY white`, `STOP`, `SET_VOLUME <f>`, `STATUS`, `QUIT`
 - [x] `STATUS` response: `STATUS running preset=white volume=0.8` (or `stopped`)
-- [x] `QUIT` removes socket + PID files and calls `std::process::exit(0)`
+- [x] `QUIT` removes socket + PID files and exits (since 3.5.15: returns from the server so the daemon fades out and kills mpv first)
 
 #### 1.5 — Auto-spawn from TUI entry point
 
@@ -108,8 +108,8 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 #### 2.3 — IPC client
 
 - [x] `tokio::net::UnixStream` in `tui/client.rs`
-- [x] Async send (fire-and-forget for `SET_VOLUME`; await `OK`/`ERROR` for `PLAY`/`STOP`)
-- [x] Reconnect loop with exponential backoff if socket drops
+- [x] Async send (since 3.5.15: one persistent connection; every command awaits its reply)
+- [x] Reconnect loop with exponential backoff if socket drops (since 3.5.15 for the main connection; previously only the unused sample subscription reconnected)
 
 #### 2.4 — Screen 2: Visualizer layout
 
@@ -122,13 +122,13 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 - [x] `←`/`→` on Screen 2 adjust volume ± 0.05, send `SET_VOLUME`
 - [x] Volume gauge widget updates immediately (optimistic)
 
-#### 2.6 — Sample ring buffer (daemon side)
+#### 2.6 — Sample ring buffer (daemon side) — removed in 3.5.8 / 3.5.15
 
 - [x] `ringbuf` crate: `Producer` in `NoiseSource`, `Consumer` in IPC handler
 - [x] Daemon sends `SAMPLES <hex>` to subscribed clients every 33 ms
 - [x] Client subscribes with `SUBSCRIBE_SAMPLES` after connecting
 
-#### 2.7 — Spectrum analyzer (TUI side)
+#### 2.7 — Spectrum analyzer (TUI side) — removed in 3.5.8
 
 - [x] Receive `SAMPLES` batches, parse hex to `Vec<f32>`
 - [x] Apply Hann window, run FFT via `spectrum-analyzer` crate
@@ -146,7 +146,7 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 - [x] `config.rs`: load `~/.config/woosh/config.toml` on daemon start
 - [x] Write defaults if absent
-- [x] Daemon respects `defaults.preset`, `defaults.volume`, `audio.sample_rate`
+- [x] Daemon starts at `defaults.volume`; the TUI's preset list starts on `defaults.preset` (since 3.5.15). `audio.sample_rate` was removed: output is fixed at 44.1 kHz mono
 
 ### Exit Criteria
 
@@ -265,7 +265,7 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 - [x] Implement `woosh pink|white|brown` shortcuts (connect to daemon, send `PLAY`, exit)
 - [x] Implement `woosh place <name>` subcommand (multi-word names work without quotes, sends `PLAY_PLACE`, exit)
 - [x] Update `main.rs` CLI parser to route these before TUI launch
-- [x] Change default to `pink` when no args — moot; `woosh` opens TUI in stopped state (Pink is index 0 in preset list)
+- [x] Change default to `pink` when no args — moot; `woosh` opens TUI in stopped state with the list on `defaults.preset` (default `pink`; White stays first in the list)
 
 #### 3.5.6 — TUI centered layout with colors
 
@@ -291,23 +291,23 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 - [x] Change audio thread to hold `Option<(OutputStream, OutputStreamHandle)>` instead of an always-open stream
 - [x] Open `OutputStream` lazily on first `Play`/`PlayPlace` command
-- [x] After `Stop`/`StopPlace`: use `recv_timeout(50 ms)` polling while either channel is fading
-- [x] On timeout: check `sink.empty()`; drop sink when true; drop stream when both sinks gone and both `PlayState::Stopped`
+- [x] While the device is open, poll with `recv_timeout(50 ms)` (since 3.5.15; previously only while fading, which kept the device after a failed mpv start or a stream that ended by itself)
+- [x] Each pass: drop voices whose sink is empty; drop the stream once no voice is playing or pending
 - [x] Correct drop ordering enforced by Rust's reverse-declaration semantics (sinks declared after stream → dropped first)
 
 #### 3.5.12 — Auto-shutdown daemon after configurable idle period
 
 - [x] Add `DaemonConfig { idle_timeout_mins: u64 }` (default 15) to `src/config.rs` and `[daemon]` section in `config.toml`
 - [x] Add `Arc<AtomicUsize>` client counter to `run_ipc_server`; RAII `ClientCountGuard` decrements on every connection exit path
-- [x] Watchdog tokio task: checks every 60 s; if `client_count == 0` and both channels stopped for ≥ `idle_timeout_mins`, sends `AudioCommand::Shutdown`
-- [x] Thread `idle_timeout_mins` through `mod.rs` → `run_ipc_server`; integration tests pass `0` (disabled) to avoid flakiness
-- [x] All 33 tests pass; zero clippy warnings
+- [x] Watchdog tokio task: checks every 60 s; if `client_count == 0` and both channels stopped for ≥ `idle_timeout_mins`, shuts the daemon down (since 3.5.15 the whole daemon exits; it used to stop only the audio thread and keep answering `OK`)
+- [x] Thread the timeout through `mod.rs` → `run_ipc_server` as `Option<Duration>`; integration tests use `None`, or 100 ms to test the watchdog
+- [x] All tests pass; zero clippy warnings
 
 #### 3.5.8 — EQ as default screen (Visualizer removed)
 
 - [x] Remove `Screen::Visualizer` variant; two screens remain: `Presets` and `Equalizer`
 - [x] Enter/Space on Presets plays preset and navigates directly to `Equalizer`
-- [x] Spectrum pipeline removed (subscribe_samples, FFT, bar_heights, sample_window fields)
+- [x] Spectrum pipeline removed (FFT, bar_heights, sample_window fields; the leftover `SUBSCRIBE_SAMPLES` command, sample buffer and client code were removed in 3.5.15)
 - [x] EQ footer updated: `s` stops playback; Esc/p/Tab returns to Presets
 - [x] Presets footer hint updated to `Enter / Space  play + eq`
 
@@ -315,7 +315,7 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 
 - [x] `[` decreases synth volume by 5 % (clamped to 0.0); `]` increases by 5 % (clamped to 1.0)
 - [x] Optimistic update: `app.volume` updated immediately; title bar reflects it on next tick
-- [x] Uses `send_fire_and_forget` (same pattern as `SET_EQ`); sends `SET_VOLUME {:.2}` to daemon
+- [x] Sends `SET_VOLUME {:.2}` to the daemon (awaits the reply on the persistent connection since 3.5.15)
 - [x] Footer hint updated: `[ ]  vol` appended to EQ screen hint line
 
 #### 3.5.14 — Noise level normalization
@@ -323,7 +323,27 @@ Phased plan from zero to full-featured. Each phase produces a working, shippable
 White noise is ~3× louder than Pink/Brown by RMS (measured baseline: White 0.580, Pink 0.194, Brown 0.199).
 
 - [x] Add `#[ignore]` test `measure_noise_levels` in `audio.rs` — prints RMS, peak, crest factor per preset (run with `cargo test measure_noise_levels -- --nocapture --ignored`)
-- [ ] Adjust per-preset scaling constants so all three types reach the same target RMS (≈ 0.20, matching Pink/Brown)
+- [x] Adjust per-preset scaling constants so all three types reach the same target RMS — done at ≈ 0.10 RMS rather than the ≈ 0.20 first proposed (see `src/daemon/AGENTS.md` baseline)
+
+#### 3.5.15 — Whole-app review fixes (2026-11-02)
+
+- [x] CI: `cargo fmt` clean; clippy `-D warnings` clean; every `#[allow]` explains itself
+- [x] Integration tests use temp-dir socket/ready paths (`run_ipc_server` takes them) instead of the real data directory
+- [x] One shutdown path for `QUIT`, idle timeout and SIGTERM: remove socket/ready/PID files, fade out both channels, kill mpv, exit
+- [x] `woosh status` reads one reply line instead of waiting for EOF (it used to hang)
+- [x] CLI play commands print daemon `ERROR` replies; `woosh <place>` shortcut (e.g. `woosh tokyo`)
+- [x] mpv: `ytdl://` prefix (without it mpv never called yt-dlp, so no place sound ever played), valid output flags (`--audio-format=s16 --audio-samplerate=44100 --audio-channels=mono`; the old `--af=aformat=…` produced no audio on mpv 0.41), `--start=300` with a 10-minute minimum video length, lock-free bounded channel with backpressure instead of a capped buffer, fade-in waits for real audio
+- [x] Place stream that ends by itself is marked stopped, so the device is released and the idle watchdog can fire
+- [x] `PLAY_PLACE` fails with an error when `mpv` or `yt-dlp` is not on `PATH`
+- [x] Audio device open failure: retry every 5 s, `STATUS … device=unavailable`, TUI banner
+- [x] `SET_VOLUME` / `SET_PLACE_VOLUME` reject NaN
+- [x] Config sections and keys default when missing (old config files no longer fall back to all defaults); parse errors are logged
+- [x] TUI: one persistent connection with reconnect backoff; `STATUS` + `GET_EQ` synced every tick; request errors no longer exit the TUI; EQ changes applied to both channels; `Q` stops the daemon; `e`/Tab opens the EQ
+- [x] TUI no longer hangs on quit (crossterm reader moved off `spawn_blocking`)
+- [x] Daemon logging honours `RUST_LOG`
+- [x] Removed dead code: `SUBSCRIBE_SAMPLES` pipeline, `ringbuf` and `spectrum-analyzer` crates, `NoiseSource` volume, `audio.sample_rate` config
+- [x] Refactors: `Channel`/`ChannelId` replace parallel synth/place fields; shared `Fade` envelope; one handler per IPC command shape; `NoisePreset::ALL`/`id()`/`label()`
+- [x] Tests for `SET_EQ`/`GET_EQ`, NaN, `QUIT`, idle shutdown, config defaults, `STATUS` parsing
 
 #### 3.5.9 — Place Selector screen and dual volume controls
 
@@ -418,7 +438,7 @@ A polished, documented release candidate that a new user can install and use wit
 | 1 | Audio daemon MVP | White noise plays, IPC works | ✅ Complete |
 | 2 | TUI + Visualizer | Interactive UI, pink/brown noise (spectrum visualizer later removed) | ✅ Complete |
 | 3 | EQ controls | Parametric EQ from TUI | ✅ Complete |
-| 3.5 | Place sounds & UI redesign | YouTube integration, dual audio, centered layout, ASCII art | 🚧 Planned |
+| 3.5 | Place sounds & UI redesign | YouTube integration, dual audio, centered layout, ASCII art | 🚧 In progress (3.5.9, 3.5.10 open) |
 | 4 | Presets & polish | Named presets, help overlay, mouse support | 📋 Future |
 | 5 | Packaging | Homebrew, AUR, crates.io | 📋 Future |
 

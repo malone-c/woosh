@@ -1,20 +1,19 @@
 use crate::daemon::audio::AudioCommand;
 use crate::daemon::eq::{GAIN_MAX, GAIN_MIN, N_BANDS};
-use crate::daemon::lifecycle::{remove_pid_file, remove_ready_file};
-use crate::daemon::state::{DaemonState, NoisePreset, PlayState};
+use crate::daemon::state::{self, ChannelId, DaemonState, NoisePreset, PlayState};
 use anyhow::Result;
-use std::path::PathBuf;
-use std::str::FromStr;
+use std::ffi::OsStr;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::time::MissedTickBehavior;
+use tokio::sync::Notify;
 
-/// Registry of live sample-stream subscriber channels.
-type SubscriberRegistry = Arc<Mutex<Vec<UnboundedSender<String>>>>;
+/// Programs `PLAY_PLACE` needs on `PATH`.
+const PLACE_TOOLS: [&str; 2] = ["mpv", "yt-dlp"];
 
 /// RAII guard that decrements a client counter when dropped.
 struct ClientCountGuard(Arc<AtomicUsize>);
@@ -25,131 +24,94 @@ impl Drop for ClientCountGuard {
     }
 }
 
-/// Runs the Unix-socket IPC server, accepting connections until the daemon exits.
+/// Runs the Unix-socket IPC server until a client sends `QUIT` or the daemon
+/// has been idle (no clients, both channels stopped) for `idle_timeout`.
+///
+/// Writes `ready_path` once the socket accepts connections. The caller removes
+/// the socket and ready files and shuts down the audio thread afterwards.
 ///
 /// # Errors
-/// Returns an error if the socket cannot be bound.
+/// Returns an error if the socket cannot be bound or the ready file cannot be written.
 pub async fn run_ipc_server(
-    socket_path: PathBuf,
+    socket_path: &Path,
+    ready_path: &Path,
     state: Arc<Mutex<DaemonState>>,
-    audio_tx: std::sync::mpsc::Sender<AudioCommand>,
-    sample_buf: Arc<Mutex<Vec<f32>>>,
-    idle_timeout_mins: u64,
+    audio_tx: Sender<AudioCommand>,
+    idle_timeout: Option<Duration>,
 ) -> Result<()> {
     // Remove stale socket from a previous run.
-    let _ = std::fs::remove_file(&socket_path);
-
-    let listener = UnixListener::bind(&socket_path)?;
+    let _ = std::fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)?;
     tracing::info!("IPC server listening on {}", socket_path.display());
 
-    let subscribers: SubscriberRegistry = Arc::new(Mutex::new(Vec::new()));
-    tokio::spawn(run_broadcast_task(
-        Arc::clone(&sample_buf),
-        Arc::clone(&subscribers),
-    ));
+    let client_count = Arc::new(AtomicUsize::new(0));
+    let shutdown = Arc::new(Notify::new());
+    if let Some(idle_timeout) = idle_timeout {
+        tokio::spawn(watch_idle(
+            Arc::clone(&state),
+            Arc::clone(&client_count),
+            Arc::clone(&shutdown),
+            idle_timeout,
+        ));
+    }
 
-    let client_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    std::fs::write(ready_path, "")?;
+    tracing::info!("daemon ready, wrote {}", ready_path.display());
 
-    // Watchdog: auto-shutdown when idle (no clients, both channels stopped).
-    if idle_timeout_mins > 0 {
-        let state_w = Arc::clone(&state);
-        let tx_w = audio_tx.clone();
-        let count_w = Arc::clone(&client_count);
-        tokio::spawn(async move {
-            let mut idle_since: Option<Instant> = None;
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                let clients = count_w.load(Ordering::Relaxed);
-                let both_stopped = state_w.lock().map_or(true, |s| {
-                    s.play_state == PlayState::Stopped && s.place_state == PlayState::Stopped
-                });
-                if clients == 0 && both_stopped {
-                    let since = idle_since.get_or_insert_with(Instant::now);
-                    let elapsed_mins = since.elapsed().as_secs() / 60;
-                    if elapsed_mins >= idle_timeout_mins {
-                        tracing::info!(
-                            "auto-shutdown: idle for {elapsed_mins} min with no clients"
-                        );
-                        let _ = tx_w.send(AudioCommand::Shutdown);
-                        break;
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _addr) = accepted?;
+                let connection = handle_connection(
+                    stream,
+                    Arc::clone(&state),
+                    audio_tx.clone(),
+                    Arc::clone(&shutdown),
+                    Arc::clone(&client_count),
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        tracing::warn!("IPC connection error: {e}");
                     }
-                } else {
-                    idle_since = None;
-                }
+                });
             }
-        });
-    }
-
-    // Yield to the tokio runtime to ensure we're in the event loop
-    // and ready to accept connections before signaling readiness.
-    tokio::task::yield_now().await;
-
-    // Write ready file. At this point, the runtime is polling and
-    // we're about to block on accept(), so we're truly ready.
-    let ready_path = crate::daemon::lifecycle::ready_path()?;
-    std::fs::write(&ready_path, "")?;
-    tracing::info!("Daemon ready, wrote {}", ready_path.display());
-
-    loop {
-        let (stream, _addr) = listener.accept().await?;
-        let state = Arc::clone(&state);
-        let tx = audio_tx.clone();
-        let socket_path = socket_path.clone();
-        let subs = Arc::clone(&subscribers);
-        let count = Arc::clone(&client_count);
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, state, tx, socket_path, subs, count).await {
-                tracing::warn!("IPC connection error: {e}");
-            }
-        });
+            () = shutdown.notified() => return Ok(()),
+        }
     }
 }
 
-/// Broadcast task: drain `sample_buf` every 33 ms and push to all subscribers.
-async fn run_broadcast_task(sample_buf: Arc<Mutex<Vec<f32>>>, subscribers: SubscriberRegistry) {
-    let mut interval = tokio::time::interval(Duration::from_millis(33));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+/// Notifies `shutdown` once no client has been connected and both channels have
+/// been stopped for `idle_timeout`.
+async fn watch_idle(
+    state: Arc<Mutex<DaemonState>>,
+    client_count: Arc<AtomicUsize>,
+    shutdown: Arc<Notify>,
+    idle_timeout: Duration,
+) {
+    let mut idle_since: Option<Instant> = None;
     loop {
-        interval.tick().await;
-
-        let samples: Vec<f32> = {
-            let Ok(mut guard) = sample_buf.lock() else {
-                continue;
-            };
-            guard.drain(..).collect()
+        tokio::time::sleep(idle_timeout.min(Duration::from_secs(60))).await;
+        let both_stopped = {
+            let s = state::lock(&state);
+            s.synth.play_state == PlayState::Stopped && s.place.play_state == PlayState::Stopped
         };
-
-        if samples.is_empty() {
+        if client_count.load(Ordering::Relaxed) > 0 || !both_stopped {
+            idle_since = None;
             continue;
         }
-
-        let msg = format!("SAMPLES {}\n", encode_samples(&samples));
-
-        let Ok(mut subs) = subscribers.lock() else {
-            continue;
-        };
-        subs.retain(|tx| tx.send(msg.clone()).is_ok());
-    }
-}
-
-/// Encode raw f32 samples as lowercase hex (8 chars/sample, little-endian).
-fn encode_samples(samples: &[f32]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(samples.len() * 8);
-    for &s in samples {
-        for b in s.to_le_bytes() {
-            let _ = write!(out, "{b:02x}");
+        if idle_since.get_or_insert_with(Instant::now).elapsed() >= idle_timeout {
+            tracing::info!("auto-shutdown: idle for {idle_timeout:?} with no clients");
+            shutdown.notify_one();
+            return;
         }
     }
-    out
 }
 
 async fn handle_connection(
     stream: UnixStream,
     state: Arc<Mutex<DaemonState>>,
-    audio_tx: std::sync::mpsc::Sender<AudioCommand>,
-    socket_path: PathBuf,
-    subscribers: SubscriberRegistry,
+    audio_tx: Sender<AudioCommand>,
+    shutdown: Arc<Notify>,
     client_count: Arc<AtomicUsize>,
 ) -> Result<()> {
     client_count.fetch_add(1, Ordering::Relaxed);
@@ -159,219 +121,186 @@ async fn handle_connection(
     let mut lines = BufReader::new(reader).lines();
 
     while let Some(line) = lines.next_line().await? {
-        let line = line.trim().to_owned();
+        let line = line.trim();
         if line.is_empty() {
             continue;
         }
-
-        // SUBSCRIBE_SAMPLES switches the connection to push-only mode.
-        if line == "SUBSCRIBE_SAMPLES" {
-            writer.write_all(b"OK\n").await?;
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            if let Ok(mut subs) = subscribers.lock() {
-                subs.push(tx);
-            }
-            while let Some(msg) = rx.recv().await {
-                if writer.write_all(msg.as_bytes()).await.is_err() {
-                    break;
-                }
-            }
-            return Ok(());
-        }
-
-        match dispatch(&line, &state, &audio_tx, &socket_path) {
-            Some(response) => {
-                writer.write_all(response.as_bytes()).await?;
-            }
-            None => {
-                // QUIT path — daemon will exit; connection closes.
-                break;
-            }
-        }
+        let Some(response) = dispatch(line, &state, &audio_tx) else {
+            shutdown.notify_one();
+            break;
+        };
+        writer.write_all(response.as_bytes()).await?;
     }
     Ok(())
 }
 
-/// Parses one IPC line and returns the response string, or `None` for QUIT.
-///
-/// QUIT calls `process::exit(0)` which never returns; `None` is the logical
-/// sentinel but is never actually observed by the caller.
-#[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
+/// Applies one IPC line and returns its response, or `None` for `QUIT`.
 fn dispatch(
     line: &str,
-    state: &Arc<Mutex<DaemonState>>,
-    audio_tx: &std::sync::mpsc::Sender<AudioCommand>,
-    socket_path: &PathBuf,
+    state: &Mutex<DaemonState>,
+    audio_tx: &Sender<AudioCommand>,
 ) -> Option<String> {
-    let mut parts = line.splitn(2, ' ');
-    let verb = parts.next().unwrap_or("").to_uppercase();
-    let arg = parts.next().unwrap_or("").trim();
+    let (verb, arg) = line.split_once(' ').unwrap_or((line, ""));
+    let arg = arg.trim();
 
-    match verb.as_str() {
-        "PLAY" => match NoisePreset::from_str(arg) {
-            Ok(preset) => {
-                let _ = audio_tx.send(AudioCommand::Play(preset));
-                Some("OK\n".to_owned())
-            }
-            Err(e) => Some(format!("ERROR {e}\n")),
-        },
-        "STOP" => {
-            let _ = audio_tx.send(AudioCommand::Stop);
-            Some("OK\n".to_owned())
-        }
-        "PLAY_PLACE" => {
-            if arg.is_empty() {
-                return Some("ERROR missing place location\n".to_owned());
-            }
-            let location = arg.to_owned();
-            let _ = audio_tx.send(AudioCommand::PlayPlace(location.clone()));
-            if let Ok(mut s) = state.lock() {
-                s.place_state = PlayState::Running;
-                s.place_location = Some(location);
-            }
-            Some("OK\n".to_owned())
-        }
-        "STOP_PLACE" => {
-            let _ = audio_tx.send(AudioCommand::StopPlace);
-            if let Ok(mut s) = state.lock() {
-                s.place_state = PlayState::Stopped;
-                s.place_location = None;
-            }
-            Some("OK\n".to_owned())
-        }
-        "SET_PLACE_VOLUME" => match arg.parse::<f32>() {
-            Ok(v) => {
-                let clamped = v.clamp(0.0, 1.0);
-                let _ = audio_tx.send(AudioCommand::SetPlaceVolume(clamped));
-                if let Ok(mut s) = state.lock() {
-                    s.place_volume = clamped;
-                }
-                Some("OK\n".to_owned())
-            }
-            Err(_) => Some("ERROR invalid place volume value\n".to_owned()),
-        },
+    let response = match verb.to_uppercase().as_str() {
+        "PLAY" => play(arg, state, audio_tx),
+        "PLAY_PLACE" => play_place(arg, state, audio_tx),
+        "STOP" => stop(ChannelId::Synth, state, audio_tx),
+        "STOP_PLACE" => stop(ChannelId::Place, state, audio_tx),
+        "SET_VOLUME" => set_volume(ChannelId::Synth, arg, state, audio_tx),
+        "SET_PLACE_VOLUME" => set_volume(ChannelId::Place, arg, state, audio_tx),
+        "SET_EQ" => set_eq(ChannelId::Synth, arg, state, audio_tx),
+        "SET_PLACE_EQ" => set_eq(ChannelId::Place, arg, state, audio_tx),
+        "GET_EQ" => format!("EQ {}\n", format_gains(&state::lock(state).synth.eq_gains)),
+        "GET_PLACE_EQ" => format!(
+            "PLACE_EQ {}\n",
+            format_gains(&state::lock(state).place.eq_gains)
+        ),
+        "STATUS" => status(state),
         "GET_PLACE_STATUS" => {
-            let response = if let Ok(s) = state.lock() {
-                let place = s.place_location.as_deref().unwrap_or("none");
-                format!(
-                    "PLACE_STATUS place={}:{}:{:.2}\n",
-                    place, s.place_state, s.place_volume
-                )
-            } else {
-                "ERROR state lock poisoned\n".to_owned()
-            };
-            Some(response)
+            let s = state::lock(state);
+            let place = s.place_location.as_deref().unwrap_or("none");
+            format!(
+                "PLACE_STATUS place={place}:{}:{:.2}\n",
+                s.place.play_state, s.place.volume
+            )
         }
-        "SET_VOLUME" => {
-            match arg.parse::<f32>() {
-                Ok(v) => {
-                    let clamped = v.clamp(0.0, 1.0);
-                    let _ = audio_tx.send(AudioCommand::SetVolume(clamped));
-                    // Also update shared state immediately so STATUS reflects it.
-                    if let Ok(mut s) = state.lock() {
-                        s.volume = clamped;
-                    }
-                    Some("OK\n".to_owned())
-                }
-                Err(_) => Some("ERROR invalid volume value\n".to_owned()),
-            }
-        }
-        "SET_EQ" => {
-            let mut eq_parts = arg.splitn(2, ' ');
-            let band_str = eq_parts.next().unwrap_or("");
-            let gain_str = eq_parts.next().unwrap_or("").trim();
+        "QUIT" => return None,
+        other => format!("ERROR unknown command: {other}\n"),
+    };
+    Some(response)
+}
 
-            let Ok(band) = band_str.parse::<usize>() else {
-                return Some("ERROR invalid band index\n".to_owned());
-            };
-            if band >= N_BANDS {
-                return Some(format!("ERROR band index out of range (0..{N_BANDS})\n"));
-            }
-            let gain = match gain_str.parse::<f32>() {
-                Ok(g) if !g.is_nan() => g.clamp(GAIN_MIN, GAIN_MAX),
-                _ => return Some("ERROR invalid gain value\n".to_owned()),
-            };
+/// Sends `command` to the audio thread and returns the IPC response.
+fn send(audio_tx: &Sender<AudioCommand>, command: AudioCommand) -> String {
+    match audio_tx.send(command) {
+        Ok(()) => "OK\n".to_owned(),
+        Err(_) => "ERROR audio thread is not running\n".to_owned(),
+    }
+}
 
-            let full_gains = if let Ok(mut s) = state.lock() {
-                s.eq_gains[band] = gain;
-                s.eq_gains
-            } else {
-                return Some("ERROR state lock poisoned\n".to_owned());
-            };
-            let _ = audio_tx.send(AudioCommand::SetEq(full_gains));
-            Some("OK\n".to_owned())
-        }
-        "SET_PLACE_EQ" => {
-            let mut eq_parts = arg.splitn(2, ' ');
-            let band_str = eq_parts.next().unwrap_or("");
-            let gain_str = eq_parts.next().unwrap_or("").trim();
+fn play(arg: &str, state: &Mutex<DaemonState>, audio_tx: &Sender<AudioCommand>) -> String {
+    let preset = match arg.parse::<NoisePreset>() {
+        Ok(preset) => preset,
+        Err(e) => return format!("ERROR {e}\n"),
+    };
+    let mut s = state::lock(state);
+    s.synth.play_state = PlayState::Running;
+    s.preset = Some(preset);
+    send(audio_tx, AudioCommand::Play(preset))
+}
 
-            let Ok(band) = band_str.parse::<usize>() else {
-                return Some("ERROR invalid band index\n".to_owned());
-            };
-            if band >= N_BANDS {
-                return Some(format!("ERROR band index out of range (0..{N_BANDS})\n"));
-            }
-            let gain = match gain_str.parse::<f32>() {
-                Ok(g) if !g.is_nan() => g.clamp(GAIN_MIN, GAIN_MAX),
-                _ => return Some("ERROR invalid gain value\n".to_owned()),
-            };
+fn play_place(
+    location: &str,
+    state: &Mutex<DaemonState>,
+    audio_tx: &Sender<AudioCommand>,
+) -> String {
+    if location.is_empty() {
+        return "ERROR missing place location\n".to_owned();
+    }
+    if let Some(tool) = missing_place_tool(&std::env::var_os("PATH").unwrap_or_default()) {
+        return format!("ERROR {tool} not found in PATH; place sounds need mpv and yt-dlp\n");
+    }
+    let mut s = state::lock(state);
+    s.place.play_state = PlayState::Running;
+    s.place_location = Some(location.to_owned());
+    send(audio_tx, AudioCommand::PlayPlace(location.to_owned()))
+}
 
-            let full_gains = if let Ok(mut s) = state.lock() {
-                s.place_eq_gains[band] = gain;
-                s.place_eq_gains
-            } else {
-                return Some("ERROR state lock poisoned\n".to_owned());
-            };
-            let _ = audio_tx.send(AudioCommand::SetPlaceEq(full_gains));
-            Some("OK\n".to_owned())
-        }
-        "GET_EQ" => {
-            if let Ok(s) = state.lock() {
-                let gains_str = s
-                    .eq_gains
-                    .iter()
-                    .map(|&g| format!("{g:.1}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                Some(format!("EQ {gains_str}\n"))
-            } else {
-                Some("ERROR state lock poisoned\n".to_owned())
-            }
-        }
-        "GET_PLACE_EQ" => {
-            if let Ok(s) = state.lock() {
-                let gains_str = s
-                    .place_eq_gains
-                    .iter()
-                    .map(|&g| format!("{g:.1}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                Some(format!("PLACE_EQ {gains_str}\n"))
-            } else {
-                Some("ERROR state lock poisoned\n".to_owned())
-            }
-        }
-        "STATUS" => {
-            let response = if let Ok(s) = state.lock() {
-                let preset = s.preset.map_or("none".to_owned(), |p| p.to_string());
-                let place = s.place_location.as_deref().unwrap_or("none");
-                format!(
-                    "STATUS synth={}:{}:{:.2} place={}:{}:{:.2}\n",
-                    preset, s.play_state, s.volume, place, s.place_state, s.place_volume
-                )
-            } else {
-                "ERROR state lock poisoned\n".to_owned()
-            };
-            Some(response)
-        }
-        "QUIT" => {
-            let _ = audio_tx.send(AudioCommand::Shutdown);
-            remove_pid_file();
-            remove_ready_file();
-            let _ = std::fs::remove_file(socket_path);
-            std::process::exit(0);
-        }
-        _ => Some(format!("ERROR unknown command: {verb}\n")),
+/// Returns the first tool in `PLACE_TOOLS` that is not in any directory of `path`.
+fn missing_place_tool(path: &OsStr) -> Option<&'static str> {
+    PLACE_TOOLS
+        .into_iter()
+        .find(|tool| !std::env::split_paths(path).any(|dir| dir.join(tool).is_file()))
+}
+
+fn stop(channel: ChannelId, state: &Mutex<DaemonState>, audio_tx: &Sender<AudioCommand>) -> String {
+    let mut s = state::lock(state);
+    s.channel_mut(channel).play_state = PlayState::Stopped;
+    if channel == ChannelId::Place {
+        s.place_location = None;
+    }
+    send(audio_tx, AudioCommand::Stop(channel))
+}
+
+fn set_volume(
+    channel: ChannelId,
+    arg: &str,
+    state: &Mutex<DaemonState>,
+    audio_tx: &Sender<AudioCommand>,
+) -> String {
+    let volume = match arg.parse::<f32>() {
+        Ok(v) if !v.is_nan() => v.clamp(0.0, 1.0),
+        _ => return format!("ERROR invalid volume: {arg}\n"),
+    };
+    let mut s = state::lock(state);
+    s.channel_mut(channel).volume = volume;
+    send(audio_tx, AudioCommand::SetVolume(channel, volume))
+}
+
+fn set_eq(
+    channel: ChannelId,
+    arg: &str,
+    state: &Mutex<DaemonState>,
+    audio_tx: &Sender<AudioCommand>,
+) -> String {
+    let (band, gain) = arg.split_once(' ').unwrap_or((arg, ""));
+    let Ok(band) = band.parse::<usize>() else {
+        return "ERROR invalid band index\n".to_owned();
+    };
+    if band >= N_BANDS {
+        return format!("ERROR band index out of range (0..{N_BANDS})\n");
+    }
+    let gain = match gain.trim().parse::<f32>() {
+        Ok(g) if !g.is_nan() => g.clamp(GAIN_MIN, GAIN_MAX),
+        _ => return "ERROR invalid gain value\n".to_owned(),
+    };
+    let mut s = state::lock(state);
+    let gains = &mut s.channel_mut(channel).eq_gains;
+    gains[band] = gain;
+    let gains = *gains;
+    send(audio_tx, AudioCommand::SetEq(channel, gains))
+}
+
+fn status(state: &Mutex<DaemonState>) -> String {
+    let s = state::lock(state);
+    let preset = s.preset.map_or("none", NoisePreset::id);
+    let place = s.place_location.as_deref().unwrap_or("none");
+    let device = if s.device_available {
+        "ok"
+    } else {
+        "unavailable"
+    };
+    format!(
+        "STATUS synth={preset}:{}:{:.2} place={place}:{}:{:.2} device={device}\n",
+        s.synth.play_state, s.synth.volume, s.place.play_state, s.place.volume
+    )
+}
+
+fn format_gains(gains: &[f32; N_BANDS]) -> String {
+    gains
+        .iter()
+        .map(|g| format!("{g:.1}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::missing_place_tool;
+    use std::ffi::OsString;
+
+    #[test]
+    fn missing_place_tool_reports_first_absent_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = OsString::from(dir.path());
+        assert_eq!(missing_place_tool(&path), Some("mpv"));
+
+        std::fs::write(dir.path().join("mpv"), "").unwrap();
+        assert_eq!(missing_place_tool(&path), Some("yt-dlp"));
+
+        std::fs::write(dir.path().join("yt-dlp"), "").unwrap();
+        assert_eq!(missing_place_tool(&path), None);
     }
 }

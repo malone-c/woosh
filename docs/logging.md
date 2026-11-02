@@ -1,53 +1,35 @@
 # Logging
 
-## Overview
+Woosh logs with the `tracing` crate. Verbosity comes from the `RUST_LOG` environment variable (default `info`).
 
-Woosh uses Rust's standard logging ecosystem with runtime-controlled verbosity. Logging is always compiled in but can be controlled via environment variables.
+## Where logs go
 
-## Logging Levels
+- **Daemon:** appended to `woosh.log` in the data directory (`~/Library/Application Support/woosh/` on macOS, `${XDG_DATA_HOME:-~/.local/share}/woosh/` on Linux). The daemon's stdout and stderr go to the same file.
+- **CLI and TUI:** stderr.
 
-- **`error`**: Critical failures, crashes, unrecoverable errors
-- **`warn`**: Important issues that don't stop execution
-- **`info`**: Key operations, startup/shutdown, major state changes (default)
-- **`debug`**: Detailed diagnostics for troubleshooting
-- **`trace`**: Very verbose, fine-grained execution details
+## Levels
+
+- `error`: failures the user should know about (audio device, mpv)
+- `warn`: problems that don't stop woosh (unreadable config, broken IPC connection)
+- `info`: startup, shutdown, and major state changes (default)
+- `debug` / `trace`: developer diagnostics
 
 ## Usage
 
-Set the `RUST_LOG` environment variable to control verbosity:
+`RUST_LOG` is read when the daemon starts, so set it on the command that spawns the daemon, or run the daemon in the foreground:
 
 ```bash
-# Info level (default)
-RUST_LOG=info woosh
-
-# Debug level for troubleshooting
-RUST_LOG=debug woosh
-
-# Trace level for deep diagnostics
-RUST_LOG=trace woosh
+RUST_LOG=debug woosh daemon --no-daemonize
 
 # Per-module control
-RUST_LOG=woosh=debug,woosh::audio=trace woosh
+RUST_LOG=woosh=info,woosh::daemon::audio=debug woosh daemon --no-daemonize
 ```
 
-## Implementation
-
-Use the `log` crate for logging:
+## In code
 
 ```rust
-use log::{error, warn, info, debug, trace};
-
-error!("Failed to connect: {}", e);
-warn!("Retrying operation");
-info!("Server started on port {}", port);
-debug!("Processing request: {:?}", req);
-trace!("Raw buffer: {:?}", buf);
+tracing::error!("audio: cannot open output device: {e}");
+tracing::info!("auto-shutdown: idle for {idle_timeout:?} with no clients");
 ```
 
-## Best Practices
-
-- Use `error!` for anything that requires user attention
-- Use `info!` for operations users should know about
-- Use `debug!` for developer troubleshooting
-- Avoid logging in hot paths unless at debug/trace level
-- Include context: module names, IDs, relevant data
+Prefix audio-thread messages with `audio:`. Never log from the audio callback (`Iterator::next` of a source); it runs on rodio's real-time thread.

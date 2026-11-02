@@ -7,18 +7,21 @@ pub mod state;
 
 use anyhow::Result;
 use audio::AudioCommand;
-use eq::N_BANDS;
 use state::DaemonState;
-use std::sync::{Arc, Mutex};
+use std::fs;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+use tokio::signal::unix::{signal, SignalKind};
 
-/// Start the audio daemon.
+/// Start the audio daemon and run it until `QUIT`, `SIGTERM`, or idle timeout.
+///
+/// On exit, removes the socket, ready and PID files, then fades out both
+/// channels and releases the audio device.
 ///
 /// # Errors
 /// Returns an error if the daemon cannot be started (e.g. already running,
-/// socket bind failure, audio device unavailable).
+/// socket bind failure).
 pub fn start(no_daemonize: bool) -> Result<()> {
-    use std::fs;
-
     let data_dir = lifecycle::data_dir()?;
     fs::create_dir_all(&data_dir)?;
 
@@ -37,43 +40,48 @@ pub fn start(no_daemonize: bool) -> Result<()> {
     if no_daemonize {
         lifecycle::write_pid_file(&pid_path)?;
     } else {
-        lifecycle::maybe_daemonize(&pid_path, &log_path)?;
+        lifecycle::daemonize(&pid_path, &log_path)?;
     }
 
     lifecycle::init_logging(&log_path)?;
 
-    // Load config; fall back to defaults on any error.
-    let config = crate::config::load().unwrap_or_default();
+    let config = crate::config::load().unwrap_or_else(|e| {
+        tracing::warn!("using default config: {e:#}");
+        crate::config::Config::default()
+    });
 
-    let state: Arc<Mutex<DaemonState>> = Arc::new(Mutex::new(DaemonState {
-        volume: config.defaults.volume,
-        ..DaemonState::default()
-    }));
+    let mut initial_state = DaemonState::default();
+    initial_state.synth.volume = config.defaults.volume.clamp(0.0, 1.0);
+    let state = Arc::new(Mutex::new(initial_state));
 
-    let sample_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-    let eq_arc: Arc<Mutex<[f32; N_BANDS]>> = Arc::new(Mutex::new([0.0f32; N_BANDS]));
-    let place_eq_arc: Arc<Mutex<[f32; N_BANDS]>> = Arc::new(Mutex::new([0.0f32; N_BANDS]));
-    let (tx, rx) = std::sync::mpsc::channel::<AudioCommand>();
+    let (audio_tx, audio_rx) = mpsc::channel::<AudioCommand>();
+    let audio_thread = audio::spawn_audio_thread(Arc::clone(&state), audio_rx);
 
-    audio::spawn_audio_thread(
-        Arc::clone(&state),
-        rx,
-        Arc::clone(&sample_buf),
-        Arc::clone(&eq_arc),
-        Arc::clone(&place_eq_arc),
-    );
+    let idle_mins = config.daemon.idle_timeout_mins;
+    let idle_timeout = (idle_mins > 0).then(|| Duration::from_secs(idle_mins * 60));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    
-    runtime.block_on(ipc::run_ipc_server(
-        socket_path,
-        state,
-        tx,
-        sample_buf,
-        config.daemon.idle_timeout_mins,
-    ))?;
+    let server_result = runtime.block_on(async {
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = ipc::run_ipc_server(&socket_path, &ready_path, state, audio_tx.clone(), idle_timeout) => result,
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM");
+                Ok(())
+            }
+        }
+    });
 
-    Ok(())
+    // Remove the runtime files first so a new daemon can start while this one fades out.
+    for path in [&socket_path, &ready_path, &pid_path] {
+        let _ = fs::remove_file(path);
+    }
+    drop(runtime);
+    let _ = audio_tx.send(AudioCommand::Shutdown);
+    let _ = audio_thread.join();
+    tracing::info!("daemon stopped");
+
+    server_result
 }
